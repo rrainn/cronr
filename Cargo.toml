@@ -1,0 +1,33 @@
+[package]
+name = "cronr"
+version = "0.1.0"
+edition = "2024"
+description = "A CLI tool for managing cron tasks"
+authors = ["rrainn"]
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }  # Command line argument parsing
+cron = "0.12"                                      # Cron expression parsing
+serde = { version = "1.0", features = ["derive"] } # Serialization/deserialization
+serde_json = "1.0"                                 # JSON serialization
+dirs = "5.0"                                       # Finding home directory
+log = "0.4"                                        # Logging
+env_logger = "0.10"                                # Logging implementation
+tokio = { version = "1.28", features = ["full"] }  # Async runtime
+chrono = { version = "0.4", features = ["serde"] } # Date and time with serde support
+anyhow = "1.0"                                     # Error handling
+thiserror = "1.0"                                  # Error definitions
+daemonize = "0.5"                                  # For creating daemon processes
+rolling-file = "0.2"                               # For log rotation
+shell-words = "1.1"                                # For parsing shell commands
+nix = "0.26"                                       # Unix-specific functionality
+
+[dev-dependencies]
+tempfile = "3.8"                                   # Temporary file handling for tests
+assert_cmd = "2.0"                                 # Testing command line applications
+predicates = "3.0"                                 # Assertions for command output
+
+[[bin]]
+name = "cronr"
+path = "src/main.rs"

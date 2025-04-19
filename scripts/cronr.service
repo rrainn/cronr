@@ -1,0 +1,12 @@
+[Unit]
+Description=Cronr daemon for managing cron tasks
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/cronr start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
