@@ -98,7 +98,7 @@ impl Daemon {
     /// Stop the daemon
     pub fn stop(&self) -> Result<()> {
         // Check if the daemon is running
-        if (!self.is_running()) {
+        if !self.is_running() {
             return Err(CronrError::DaemonStartFailed(
                 "Daemon is not running".into(),
             ));

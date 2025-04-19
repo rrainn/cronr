@@ -117,7 +117,7 @@ fn create_job(command: String, cron_expression: String) -> Result<()> {
         let data_dir = job_manager.config().data_dir().to_path_buf();
         let daemon = Daemon::new(data_dir);
         // Start daemon if not already running
-        if (!daemon.is_running()) {
+        if !daemon.is_running() {
             daemon.start()?;
             println!("Started daemon for job execution");
         }

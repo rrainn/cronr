@@ -199,7 +199,7 @@ fn test_status_command() {
 
     // Ensure no jobs exist
     let cronr_dir = home_dir.join(".cronr");
-    if (cronr_dir.exists()) {
+    if cronr_dir.exists() {
         fs::remove_dir_all(&cronr_dir).unwrap();
     }
 
