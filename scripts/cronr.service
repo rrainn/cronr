@@ -4,6 +4,7 @@ After=network.target
 
 [Service]
 Type=forking
+PIDFile=/root/.cronr/cronr.pid
 ExecStart=/root/.cargo/bin/cronr start
 Restart=on-failure
 RestartSec=5
