@@ -37,7 +37,7 @@ A robust CLI tool for managing cron tasks with automatic job execution and log m
    ./scripts/install_macos.sh
    ```
 
-### Prebuilt Binaries
+### Prebuilt Binaries (Coming Soon)
 
 Download the appropriate binary for your platform from the [Releases](https://github.com/rrainn/cronr/releases) page.
 
