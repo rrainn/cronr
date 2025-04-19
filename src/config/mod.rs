@@ -1,7 +1,7 @@
 use dirs;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -279,50 +279,41 @@ impl JobManager {
         // Get the jobs file path
         let jobs_file = config.jobs_file();
 
-        // Check if the file exists
+        // If file doesn't exist, start fresh with no jobs and next ID 0
         if !jobs_file.exists() {
-            // Create an empty set of jobs
             return Ok((HashMap::new(), 0));
         }
 
-        // Open the file
+        // Open and read the file
         let file = File::open(&jobs_file).map_err(|e| path_error_to_config_error(&jobs_file, e))?;
-
-        // Read the file
         let reader = BufReader::new(file);
 
-        // Parse the JSON
-        let json: HashMap<String, Job> = match serde_json::from_reader(reader) {
-            Ok(json) => json,
-            Err(e) => {
-                return Err(CronrError::ConfigError(format!(
-                    "Failed to parse jobs file: {}",
-                    e
-                )));
-            }
+        // Parse JSON into a value
+        let value: serde_json::Value = serde_json::from_reader(reader)
+            .map_err(|e| CronrError::ConfigError(format!("Failed to parse jobs file: {}", e)))?;
+
+        // Determine if JSON includes metadata
+        let (raw_map, mut next_id) = if let Some(meta) = value.get("next_id") {
+            // New format with next_id and jobs
+            let id = meta.as_u64().ok_or_else(|| CronrError::ConfigError("Invalid next_id in jobs file".into()))? as usize;
+            let jobs_val = value.get("jobs").ok_or_else(|| CronrError::ConfigError("Missing jobs in jobs file".into()))?;
+            let map: HashMap<String, Job> = serde_json::from_value(jobs_val.clone())
+                .map_err(|e| CronrError::ConfigError(format!("Failed to parse jobs section: {}", e)))?;
+            (map, id)
+        } else {
+            // Legacy format: direct mapping of ID to Job
+            let map: HashMap<String, Job> = serde_json::from_value(value.clone())
+                .map_err(|e| CronrError::ConfigError(format!("Failed to parse jobs file: {}", e)))?;
+            (map, 0)
         };
 
-        // Convert the IDs to integers
+        // Convert keys to usize and collect jobs
         let mut jobs = HashMap::new();
-        let mut next_id = 0;
-
-        for (id_str, job) in json {
-            // Parse the ID
-            let id = match id_str.parse::<usize>() {
-                Ok(id) => id,
-                Err(_) => {
-                    return Err(CronrError::ConfigError(format!(
-                        "Invalid job ID: {}",
-                        id_str
-                    )));
-                }
-            };
-
-            // Add the job
+        for (id_str, job) in raw_map {
+            let id = id_str.parse::<usize>().map_err(|_| CronrError::ConfigError(format!("Invalid job ID: {}", id_str)))?;
             jobs.insert(id, job);
-
-            // Update the next ID
-            if id >= next_id {
+            // Calculate the next ID as max(existing+1, metadata)
+            if id + 1 > next_id {
                 next_id = id + 1;
             }
         }
@@ -336,28 +327,29 @@ impl JobManager {
         let jobs_file = self.config.jobs_file();
 
         // Create a temporary file
-        let temp_file = jobs_file.with_file_name(format!(
-            "{}.tmp",
-            jobs_file.file_name().unwrap().to_string_lossy()
-        ));
-
-        // Create the file
-        let file =
-            File::create(&temp_file).map_err(|e| path_error_to_config_error(&temp_file, e))?;
+        let temp_file = jobs_file.with_file_name(format!("{}.tmp", jobs_file.file_name().unwrap().to_string_lossy()));
 
         // Create the writer
-        let writer = BufWriter::new(file);
+        let file = File::create(&temp_file).map_err(|e| path_error_to_config_error(&temp_file, e))?;
+        let mut writer = BufWriter::new(file);
 
-        // Get the jobs
-        let jobs = self.jobs.lock().await;
+        // Clone jobs into a local owned map and get next_id
+        let jobs_map: HashMap<String, Job> = {
+            let jobs_guard = self.jobs.lock().await;
+            jobs_guard.iter().map(|(id, job)| (id.to_string(), job.clone())).collect()
+        };
+        let next_id = { *self.next_id.lock().await };
 
-        // Convert the IDs to strings
-        let json: HashMap<String, &Job> =
-            jobs.iter().map(|(id, job)| (id.to_string(), job)).collect();
+        // Build wrapper with metadata and jobs
+        let wrapper = serde_json::json!({
+            "next_id": next_id,
+            "jobs": jobs_map
+        });
 
         // Write the JSON
-        serde_json::to_writer_pretty(writer, &json)
+        serde_json::to_writer_pretty(&mut writer, &wrapper)
             .map_err(|e| CronrError::ConfigError(format!("Failed to write jobs file: {}", e)))?;
+        writer.flush().map_err(|e| CronrError::ConfigError(format!("Failed to flush jobs file: {}", e)))?;
 
         // Rename the temporary file to the jobs file
         fs::rename(&temp_file, &jobs_file)
