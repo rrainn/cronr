@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=forking
-ExecStart=/usr/bin/cronr start
+ExecStart=/root/.cargo/bin/cronr start
 Restart=on-failure
 RestartSec=5
 
