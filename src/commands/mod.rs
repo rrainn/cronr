@@ -263,8 +263,12 @@ fn check_daemon_status() -> Result<()> {
 
     // Run the async block
     rt.block_on(async {
-        // Load the job manager from existing configuration
-        let job_manager = JobManager::load().await?;
+        // Load or initialize the job manager (initialize if data dir missing)
+        let job_manager = match JobManager::load().await {
+            Ok(jm) => jm,
+            Err(CronrError::ConfigError(_)) => JobManager::new().await?,
+            Err(e) => return Err(e),
+        };
 
         // Get active job count
         let active_count = job_manager.get_all_jobs().await.len();
