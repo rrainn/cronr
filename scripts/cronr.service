@@ -3,6 +3,7 @@ Description=Cronr daemon for managing cron tasks
 After=network.target
 
 [Service]
+ExecStartPre=/usr/bin/rm -f "/root/.cronr/cronr.pid"
 Type=forking
 PIDFile=/root/.cronr/cronr.pid
 ExecStart=/root/.cargo/bin/cronr start
