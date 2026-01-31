@@ -199,8 +199,12 @@ fn start_daemon() -> Result<()> {
 
     // Run the async block
     rt.block_on(async {
-        // Try to load the job manager from existing configuration
-        let job_manager = JobManager::load().await?;
+        // Load or initialize the job manager (initialize if data dir missing)
+        let job_manager = match JobManager::load().await {
+            Ok(jm) => jm,
+            Err(CronrError::ConfigError(_)) => JobManager::new().await?,
+            Err(e) => return Err(e),
+        };
 
         // Create the daemon
         let daemon = Daemon::new(job_manager.config().data_dir().to_path_buf());
