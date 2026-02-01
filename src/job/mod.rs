@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -29,6 +30,11 @@ pub struct Job {
 
     /// The next run time (if any)
     pub next_run: Option<DateTime<Utc>>,
+
+    /// Environment variables captured when the job was created
+    /// This ensures jobs run with the user's PATH and other important env vars
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 impl Job {
@@ -42,12 +48,22 @@ impl Job {
         // Calculate the next run time
         let next_run = schedule.upcoming(Utc).next();
 
+        // Capture important environment variables from the user's shell
+        // This ensures commands like docker, brew, etc. are found when the job runs
+        let mut env = HashMap::new();
+        for key in &["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL"] {
+            if let Ok(value) = std::env::var(key) {
+                env.insert(key.to_string(), value);
+            }
+        }
+
         Ok(Job {
             command,
             cron_expression,
             enabled: true,
             last_executed: None,
             next_run,
+            env,
         })
     }
 
@@ -160,6 +176,12 @@ impl Job {
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Set the captured environment variables (PATH, HOME, etc.)
+        // This ensures the job runs with the user's environment from when it was created
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
 
         // Run the command
         let child = match command.spawn() {
