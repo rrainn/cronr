@@ -9,6 +9,9 @@ if [ -d "$HOME/.cronr" ]; then
 	exit 1
 fi
 
+# Create the .cronr directory for logs
+mkdir -p "$HOME/.cronr"
+
 # Create the LaunchAgent plist file
 PLIST_FILE="$HOME/Library/LaunchAgents/com.rrainn.cronr.plist"
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -39,7 +42,7 @@ cat > "$PLIST_FILE" << EOL
 EOL
 
 # Load the LaunchAgent
-launchctl load "$PLIST_FILE"
+launchctl bootstrap gui/$(id -u) "$PLIST_FILE"
 
 echo "Cronr LaunchAgent installed successfully!"
 echo "Cronr will now start automatically when you log in"
