@@ -16,6 +16,9 @@ mkdir -p "$HOME/.cronr"
 PLIST_FILE="$HOME/Library/LaunchAgents/com.rrainn.cronr.plist"
 mkdir -p "$HOME/Library/LaunchAgents"
 
+# Unload any existing service first
+launchctl bootout gui/$(id -u)/com.rrainn.cronr 2>/dev/null || true
+
 # Create the plist file
 cat > "$PLIST_FILE" << EOL
 <?xml version="1.0" encoding="UTF-8"?>
