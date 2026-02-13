@@ -389,6 +389,24 @@ impl DaemonRunner {
                 }
             }
 
+            // Detect and clean up completed job executor tasks.
+            // If a job's executor task has finished (e.g., due to an unrecoverable error),
+            // remove it from running jobs so it can be restarted on the next cycle.
+            let completed_ids: Vec<usize> = self
+                .job_handles
+                .iter()
+                .filter(|(_, handle)| handle.is_finished())
+                .map(|(id, _)| *id)
+                .collect();
+            for id in completed_ids {
+                log::warn!(
+                    "Job {} executor task completed unexpectedly, will restart",
+                    id
+                );
+                self.job_handles.remove(&id);
+                self.job_stop_signals.remove(&id);
+            }
+
             // Start any new enabled jobs not yet running
             for (id, job) in &jobs {
                 if job.enabled && !self.job_handles.contains_key(id) {

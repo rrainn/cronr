@@ -3,8 +3,9 @@ use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time;
 
@@ -146,6 +147,11 @@ impl Job {
 
     /// Run the job
     pub async fn run(&mut self, config: &Config, job_id: usize) -> Result<()> {
+        // Advance the schedule immediately to prevent tight retry loops on failure.
+        // Even if this execution fails, we should wait for the next scheduled time
+        // rather than retrying immediately.
+        self.set_as_run();
+
         // Get the stdout and stderr paths
         let stdout_path = config.stdout_log_path(job_id);
         let stderr_path = config.stderr_log_path(job_id);
@@ -170,7 +176,8 @@ impl Job {
             config.log_rotation().clone(),
         );
 
-        // Create the command
+        // Create the command using tokio's async process API
+        // to avoid blocking the runtime during long-running jobs
         let mut command = Command::new(program);
         command
             .args(args)
@@ -183,7 +190,22 @@ impl Job {
             command.env(key, value);
         }
 
-        // Run the command
+        // Create a new process group for the child process to isolate it from
+        // signals sent to the daemon's process group. This prevents signals from
+        // interrupting child process system calls (e.g., "Interrupted system call").
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                // Ignore errors since failing to set process group is not critical
+                let _ = nix::unistd::setpgid(
+                    nix::unistd::Pid::from_raw(0),
+                    nix::unistd::Pid::from_raw(0),
+                );
+                Ok(())
+            });
+        }
+
+        // Spawn the child process
         let child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -194,8 +216,8 @@ impl Job {
             }
         };
 
-        // Get the output from the command
-        let output = match child.wait_with_output() {
+        // Wait for the child to complete asynchronously (non-blocking)
+        let output = match child.wait_with_output().await {
             Ok(output) => output,
             Err(e) => {
                 return Err(CronrError::JobExecutionError(format!(
@@ -205,14 +227,25 @@ impl Job {
             }
         };
 
+        // Log the exit status for diagnostics
+        if output.status.success() {
+            log::info!("Job {} command exited successfully", job_id);
+        } else {
+            log::warn!(
+                "Job {} command exited with status: {}",
+                job_id,
+                output
+                    .status
+                    .code()
+                    .map_or("signal".to_string(), |c| c.to_string())
+            );
+        }
+
         // Write stdout with log rotation
         logger.write_stdout(&output.stdout)?;
 
         // Write stderr with log rotation
         logger.write_stderr(&output.stderr)?;
-
-        // Mark the job as run
-        self.set_as_run();
 
         Ok(())
     }
@@ -351,6 +384,7 @@ impl JobExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     #[test]
     fn test_job_creation() {
@@ -390,5 +424,36 @@ mod tests {
 
         // Check that the job is not due
         assert!(!job.is_due());
+    }
+
+    /// Test that a failed job run still advances the schedule.
+    /// This prevents execute_with_schedule from spinning in a tight retry loop
+    /// when a job's command fails to spawn.
+    #[tokio::test]
+    async fn test_failed_job_run_still_advances_schedule() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+
+        // Create a job with a command that will fail to spawn
+        let mut job = Job::new(
+            "/nonexistent_command_xyz_12345".to_string(),
+            "0 * * * * *".to_string(),
+        )
+        .unwrap();
+
+        // Set next_run to the past (simulating a job that was due to run)
+        let past_time = Utc::now() - chrono::Duration::hours(1);
+        job.next_run = Some(past_time);
+
+        // Run the job - should fail because the command doesn't exist
+        let result = job.run(&config, 0).await;
+        assert!(result.is_err(), "Expected job to fail with non-existent command");
+
+        // After the fix: next_run should advance to the future to prevent tight retry loops
+        let new_next_run = job.next_run().unwrap();
+        assert!(
+            new_next_run > Utc::now(),
+            "next_run should advance to the future even after a failed run"
+        );
     }
 }
