@@ -227,27 +227,30 @@ impl Job {
             }
         };
 
-        // Log the exit status for diagnostics
+        // Always write stdout/stderr logs regardless of exit status,
+        // so diagnostic output is available for failed jobs too
+        logger.write_stdout(&output.stdout)?;
+        logger.write_stderr(&output.stderr)?;
+
+        // Check exit status and return an error for non-zero exits
         if output.status.success() {
             log::info!("Job {} command exited successfully", job_id);
+            Ok(())
         } else {
+            let exit_info = output
+                .status
+                .code()
+                .map_or("signal".to_string(), |c| c.to_string());
             log::warn!(
                 "Job {} command exited with status: {}",
                 job_id,
-                output
-                    .status
-                    .code()
-                    .map_or("signal".to_string(), |c| c.to_string())
+                exit_info
             );
+            Err(CronrError::JobExecutionError(format!(
+                "Command exited with status: {}",
+                exit_info
+            )))
         }
-
-        // Write stdout with log rotation
-        logger.write_stdout(&output.stdout)?;
-
-        // Write stderr with log rotation
-        logger.write_stderr(&output.stderr)?;
-
-        Ok(())
     }
 }
 
@@ -361,6 +364,12 @@ impl JobExecutor {
                     log::info!("Job {} executed successfully", id);
                 }
 
+                // Persist the updated job state (next_run, last_executed) to disk
+                // so the daemon reload cycle and any restarts see accurate info
+                if let Err(e) = config.update_job_state(id, &job) {
+                    log::error!("Failed to persist job {} state: {}", id, e);
+                }
+
                 // Update the next run time
                 next_run_time = match job.next_run() {
                     Some(time) => time,
@@ -424,6 +433,24 @@ mod tests {
 
         // Check that the job is not due
         assert!(!job.is_due());
+    }
+
+    /// Test that run() returns an error when the command exits with a non-zero status.
+    /// This ensures callers know the job failed so they can log/report it accurately.
+    #[tokio::test]
+    async fn test_run_returns_error_on_nonzero_exit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+
+        // Create a job with a command that exits with a non-zero status
+        let mut job = Job::new("false".to_string(), "0 * * * * *".to_string()).unwrap();
+
+        // Run the job — `false` exits with status 1
+        let result = job.run(&config, 0).await;
+        assert!(
+            result.is_err(),
+            "Expected run() to return an error when the command exits with non-zero status"
+        );
     }
 
     /// Test that a failed job run still advances the schedule.

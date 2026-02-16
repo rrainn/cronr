@@ -124,6 +124,59 @@ impl Config {
     pub fn log_rotation(&self) -> &LogRotation {
         &self.log_rotation
     }
+
+    /// Update a single job's persisted state (next_run, last_executed) in the jobs file.
+    /// This is called from the job executor after each run to keep the on-disk state
+    /// in sync with the in-memory state, so that daemon reload cycles and restarts
+    /// see accurate schedule information.
+    pub fn update_job_state(&self, job_id: usize, job: &crate::job::Job) -> Result<()> {
+        let jobs_file = self.jobs_file();
+
+        // Nothing to update if the jobs file doesn't exist yet
+        if !jobs_file.exists() {
+            return Ok(());
+        }
+
+        // Read the current jobs file
+        let file =
+            File::open(&jobs_file).map_err(|e| path_error_to_config_error(&jobs_file, e))?;
+        let reader = BufReader::new(file);
+        let mut value: serde_json::Value = serde_json::from_reader(reader)
+            .map_err(|e| CronrError::ConfigError(format!("Failed to parse jobs file: {}", e)))?;
+
+        // Navigate to the correct job entry (supports both new and legacy format)
+        let id_str = job_id.to_string();
+        let jobs_obj = if let Some(jobs) = value.get_mut("jobs") {
+            jobs
+        } else {
+            &mut value
+        };
+
+        // Serialize the updated job and replace the entry
+        if let Some(job_value) = jobs_obj.get_mut(&id_str) {
+            let job_json = serde_json::to_value(job)
+                .map_err(|e| CronrError::ConfigError(format!("Failed to serialize job: {}", e)))?;
+            *job_value = job_json;
+        }
+
+        // Write back atomically via a temp file + rename
+        let temp_file = jobs_file.with_file_name(format!(
+            "{}.tmp",
+            jobs_file.file_name().unwrap().to_string_lossy()
+        ));
+        let file =
+            File::create(&temp_file).map_err(|e| path_error_to_config_error(&temp_file, e))?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &value)
+            .map_err(|e| CronrError::ConfigError(format!("Failed to write jobs file: {}", e)))?;
+        writer
+            .flush()
+            .map_err(|e| CronrError::ConfigError(format!("Failed to flush jobs file: {}", e)))?;
+        fs::rename(&temp_file, &jobs_file)
+            .map_err(|e| path_error_to_config_error(&jobs_file, e))?;
+
+        Ok(())
+    }
 }
 
 /// Manager for cron jobs
@@ -479,5 +532,46 @@ mod tests {
         assert!(id1 < id2);
         assert!(id2 < id3);
         assert!(id3 < id4);
+    }
+
+    /// Test that update_job_state persists next_run and last_executed to disk.
+    /// This ensures the daemon reload cycle sees accurate schedule data after execution.
+    #[tokio::test]
+    async fn test_update_job_state_persists_to_disk() {
+        // Set up a temp directory with a job manager
+        let temp_dir = tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+        let job_manager = JobManager::with_config(config.clone()).await.unwrap();
+
+        // Add a job and save it to disk
+        let id = job_manager
+            .add_job("echo hello".to_string(), "0 * * * * *".to_string())
+            .await
+            .unwrap();
+
+        // Get the job and verify initial state
+        let mut job = job_manager.get_job(id).await.unwrap();
+        assert!(job.last_executed.is_none(), "last_executed should be None initially");
+
+        // Simulate execution by calling set_as_run
+        job.set_as_run();
+        let updated_next_run = job.next_run();
+        let updated_last_executed = job.last_executed;
+        assert!(updated_last_executed.is_some(), "last_executed should be set after run");
+
+        // Persist the updated state to disk
+        config.update_job_state(id, &job).unwrap();
+
+        // Reload from disk and verify the persisted state
+        let reloaded_manager = JobManager::with_config(config).await.unwrap();
+        let reloaded_job = reloaded_manager.get_job(id).await.unwrap();
+        assert_eq!(
+            reloaded_job.last_executed, updated_last_executed,
+            "Reloaded last_executed should match the persisted value"
+        );
+        assert_eq!(
+            reloaded_job.next_run(), updated_next_run,
+            "Reloaded next_run should match the persisted value"
+        );
     }
 }
