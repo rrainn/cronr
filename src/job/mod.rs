@@ -156,19 +156,6 @@ impl Job {
         let stdout_path = config.stdout_log_path(job_id);
         let stderr_path = config.stderr_log_path(job_id);
 
-        // Parse the command to get the program and arguments
-        let parts = shell_words::split(&self.command).map_err(|e| {
-            CronrError::JobExecutionError(format!("Failed to parse command: {}", e))
-        })?;
-
-        if parts.is_empty() {
-            return Err(CronrError::JobExecutionError("Empty command".into()));
-        }
-
-        // Get the program and arguments
-        let program = &parts[0];
-        let args = &parts[1..];
-
         // Create a logger with log rotation
         let logger = Logger::new(
             stdout_path.clone(),
@@ -176,16 +163,25 @@ impl Job {
             config.log_rotation().clone(),
         );
 
-        // Create the command using tokio's async process API
-        // to avoid blocking the runtime during long-running jobs
-        let mut command = Command::new(program);
+        // Determine the user's shell (from captured env, or fall back to /bin/sh)
+        let shell = self
+            .env
+            .get("SHELL")
+            .map(|s| s.as_str())
+            .unwrap_or("/bin/sh");
+
+        // Run the command through a login shell so that profile files
+        // (~/.bash_profile, ~/.zprofile, /etc/profile, etc.) are sourced.
+        // This ensures PATH and other environment variables are properly set up,
+        // even though the daemon process itself runs with a minimal environment.
+        log::debug!("Job {} running via login shell: {} -l -c {:?}", job_id, shell, self.command);
+        let mut command = Command::new(shell);
         command
-            .args(args)
+            .args(["-l", "-c", &self.command])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Set the captured environment variables (PATH, HOME, etc.)
-        // This ensures the job runs with the user's environment from when it was created
+        // Also apply captured env vars as overrides on top of the login shell env
         for (key, value) in &self.env {
             command.env(key, value);
         }
@@ -481,6 +477,50 @@ mod tests {
         assert!(
             new_next_run > Utc::now(),
             "next_run should advance to the future even after a failed run"
+        );
+    }
+
+    /// Test that jobs run through a login shell and capture stdout correctly.
+    /// This verifies the shell-based execution path works end-to-end.
+    #[tokio::test]
+    async fn test_run_uses_shell_and_captures_output() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+
+        // Use a command that only works when interpreted by a shell (echo is a shell builtin)
+        let mut job = Job::new("echo hello_from_shell".to_string(), "0 * * * * *".to_string()).unwrap();
+
+        let result = job.run(&config, 0).await;
+        assert!(result.is_ok(), "Expected shell command to succeed: {:?}", result);
+
+        // Verify stdout was captured to the log file
+        let stdout_log = std::fs::read_to_string(config.stdout_log_path(0)).unwrap();
+        assert!(
+            stdout_log.contains("hello_from_shell"),
+            "Expected stdout log to contain command output, got: {}",
+            stdout_log
+        );
+    }
+
+    /// Test that the SHELL env var is used and a login shell receives captured env overrides.
+    #[tokio::test]
+    async fn test_run_passes_captured_env_to_shell() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+
+        // Create a job that prints a custom env var we'll inject
+        let mut job = Job::new("echo $CRONR_TEST_VAR".to_string(), "0 * * * * *".to_string()).unwrap();
+        job.env.insert("CRONR_TEST_VAR".to_string(), "test_value_42".to_string());
+
+        let result = job.run(&config, 0).await;
+        assert!(result.is_ok(), "Expected command to succeed: {:?}", result);
+
+        // Verify the env var was available inside the command
+        let stdout_log = std::fs::read_to_string(config.stdout_log_path(0)).unwrap();
+        assert!(
+            stdout_log.contains("test_value_42"),
+            "Expected stdout to contain env var value, got: {}",
+            stdout_log
         );
     }
 }

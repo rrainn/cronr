@@ -362,12 +362,13 @@ impl DaemonRunner {
             // Debug each job's schedule details
             for (id, job) in &jobs {
                 log::debug!(
-                    "Job {} details: command={}, enabled={}, next_run={:?}, last_executed={:?}",
+                    "Job {} details: command={}, enabled={}, next_run={:?}, last_executed={:?}, env_vars={}",
                     id,
                     job.command(),
                     job.enabled,
                     job.next_run(),
-                    job.last_executed
+                    job.last_executed,
+                    job.env.len()
                 );
             }
 
