@@ -182,14 +182,25 @@ impl Daemon {
             }
         };
 
-        // Check if the process is running
+        // Check if the process is running AND is actually the cronr daemon.
+        // Only checking liveness (via SIGCONT) is insufficient: after the daemon exits the OS
+        // can reuse its PID for an entirely different process, which would cause a false
+        // positive and prevent the daemon from ever being restarted.
         #[cfg(target_os = "linux")]
         {
             use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
 
             match kill(Pid::from_raw(pid as i32), Signal::SIGCONT) {
-                Ok(_) => true,
+                Ok(_) => {
+                    // Process is alive — verify it is cronr, not a PID-reuse impostor
+                    if !Self::is_cronr_process(pid) {
+                        let _ = fs::remove_file(&pid_file);
+                        false
+                    } else {
+                        true
+                    }
+                }
                 Err(_) => {
                     // Process is not running, clean up the PID file
                     let _ = fs::remove_file(&pid_file);
@@ -204,7 +215,15 @@ impl Daemon {
             use nix::unistd::Pid;
 
             match kill(Pid::from_raw(pid as i32), Signal::SIGCONT) {
-                Ok(_) => true,
+                Ok(_) => {
+                    // Process is alive — verify it is cronr, not a PID-reuse impostor
+                    if !Self::is_cronr_process(pid) {
+                        let _ = fs::remove_file(&pid_file);
+                        false
+                    } else {
+                        true
+                    }
+                }
                 Err(_) => {
                     // Process is not running, clean up the PID file
                     let _ = fs::remove_file(&pid_file);
@@ -216,7 +235,7 @@ impl Daemon {
         #[cfg(target_os = "windows")]
         {
             let output = match Command::new("tasklist")
-                .args(&["/FI", &format!("PID eq {}", pid)])
+                .args(&["/FI", &format!("PID eq {}", pid), "/FI", "IMAGENAME eq cronr.exe"])
                 .output()
             {
                 Ok(o) => o,
@@ -231,9 +250,39 @@ impl Daemon {
             if stdout.contains(&format!("{}", pid)) {
                 true
             } else {
-                // Process is not running, clean up the PID file
+                // Process is not running or is not cronr, clean up the PID file
                 let _ = fs::remove_file(&pid_file);
                 false
+            }
+        }
+    }
+
+    /// Return true if the process with the given PID has "cronr" in its executable name.
+    /// Used to guard against PID reuse after an unclean daemon shutdown.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn is_cronr_process(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            // /proc/<pid>/comm holds the executable name (up to 15 chars, no path)
+            let comm_path = format!("/proc/{}/comm", pid);
+            match fs::read_to_string(&comm_path) {
+                Ok(comm) => comm.trim().contains("cronr"),
+                Err(_) => false,
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // `ps -p <pid> -o comm=` prints just the executable basename
+            let output = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "comm="])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let name = String::from_utf8_lossy(&out.stdout);
+                    name.trim().contains("cronr")
+                }
+                _ => false,
             }
         }
     }
@@ -584,5 +633,43 @@ mod tests {
 
         // Check that the PID file is in the data directory
         assert_eq!(daemon.pid_file(), data_dir.join("cronr.pid"));
+    }
+
+    /// Regression test: `is_running()` must return false when the stored PID belongs to a
+    /// non-cronr process. Before the fix, `is_running()` only checked whether *any* process
+    /// with that PID was alive (via SIGCONT), which caused false positives whenever the OS
+    /// reused a dead daemon's PID for a completely different program.
+    #[cfg(unix)]
+    #[test]
+    fn test_is_running_false_for_non_cronr_process() {
+        let temp_dir = tempdir().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+
+        // Spawn `sleep 30` — a process that is definitely not "cronr".
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let pid = child.id();
+
+        // Write its PID into the daemon PID file, simulating a reused PID.
+        let pid_file = data_dir.join("cronr.pid");
+        std::fs::write(&pid_file, pid.to_string()).unwrap();
+
+        let daemon = Daemon::new(data_dir.clone());
+
+        // is_running() should return false: the process exists but is not cronr.
+        let result = daemon.is_running();
+
+        // Always clean up the child process regardless of the assertion outcome.
+        child.kill().ok();
+        child.wait().ok();
+
+        assert!(
+            !result,
+            "is_running() returned true for a non-cronr process (PID {}); \
+             stale/reused PIDs must not be treated as a live daemon",
+            pid
+        );
     }
 }

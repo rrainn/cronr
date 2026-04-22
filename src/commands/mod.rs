@@ -326,6 +326,18 @@ fn run_daemon_internal() -> Result<()> {
         // Run the daemon
         daemon_runner.run().await?;
 
+        // Clean up the PID file on graceful shutdown.
+        // Without this, a stale PID file left on disk can cause `is_running()` to return a
+        // false positive if the OS later reuses the dead daemon's PID for another program.
+        if let Ok(data_dir) = crate::config::Config::default_data_dir() {
+            let pid_file = data_dir.join("cronr.pid");
+            if let Err(e) = std::fs::remove_file(&pid_file) {
+                log::warn!("Could not remove PID file on shutdown: {}", e);
+            } else {
+                log::info!("Removed PID file on shutdown");
+            }
+        }
+
         // This should never return
         process::exit(0);
     })
