@@ -27,10 +27,13 @@ if [ "$UPGRADE" = false ] && [ -d "/root/.cronr" ]; then
 	exit 1
 fi
 
-# Always build a fresh release binary so the installed version is up to date
-echo "Building release binary..."
+# Always build a fresh release binary so the installed version matches HEAD.
+# Run cargo as the invoking user because root's PATH typically does not
+# include the user-local cargo installation (e.g. ~/.cargo/bin or linuxbrew).
+REAL_USER="${SUDO_USER:-$USER}"
+echo "Building release binary as $REAL_USER..."
 cd "$REPO_ROOT"
-cargo build --release
+sudo -u "$REAL_USER" bash -lc "cd '$REPO_ROOT' && cargo build --release"
 
 # Stop the running service before replacing the binary to avoid "Text file busy"
 if systemctl is-active --quiet cronr.service 2>/dev/null; then
