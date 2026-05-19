@@ -1,25 +1,39 @@
 #!/bin/bash
-# Install script for cronr on macOS systems
+# Install script for cronr on macOS systems.
+# Supports both fresh installs and upgrades — safe to re-run.
 
 set -e
 
-# Check if .cronr already exists in the home directory
-if [ -d "$HOME/.cronr" ]; then
-	echo "Error: $HOME/.cronr directory already exists. If you want to reinstall, remove this directory first."
-	exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Create the .cronr directory for logs
-mkdir -p "$HOME/.cronr"
-
-# Create the LaunchAgent plist file
+# LaunchAgent plist path
 PLIST_FILE="$HOME/Library/LaunchAgents/com.rrainn.cronr.plist"
 mkdir -p "$HOME/Library/LaunchAgents"
 
-# Unload any existing service first
+# Detect whether this is an upgrade or a fresh install
+IS_UPGRADE=false
+if [ -f "$PLIST_FILE" ]; then
+	IS_UPGRADE=true
+fi
+
+# Unload the existing LaunchAgent before replacing the binary so macOS
+# releases its hold on the executable file.
 launchctl bootout gui/$(id -u)/com.rrainn.cronr 2>/dev/null || true
 
-# Create the plist file
+# Build and install the binary via cargo so the installed version matches HEAD
+echo "Building and installing cronr..."
+cd "$REPO_ROOT"
+cargo install --path .
+
+if [ "$IS_UPGRADE" = false ]; then
+	# Fresh install only: create the data directory for logs
+	mkdir -p "$HOME/.cronr"
+fi
+
+# Write (or refresh) the plist so the binary path is always up to date.
+# We regenerate it on every run in case cargo installed to a new location.
+CRONR_BIN="$(which cronr)"
 cat > "$PLIST_FILE" << EOL
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -29,7 +43,7 @@ cat > "$PLIST_FILE" << EOL
 	<string>com.rrainn.cronr</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>$(which cronr)</string>
+		<string>$CRONR_BIN</string>
 		<string>start</string>
 	</array>
 	<key>RunAtLoad</key>
@@ -47,5 +61,10 @@ EOL
 # Load the LaunchAgent
 launchctl bootstrap gui/$(id -u) "$PLIST_FILE"
 
-echo "Cronr LaunchAgent installed successfully!"
-echo "Cronr will now start automatically when you log in"
+if [ "$IS_UPGRADE" = true ]; then
+	echo "Cronr upgraded successfully!"
+else
+	echo "Cronr installed successfully!"
+fi
+echo "Cronr will start automatically when you log in."
+echo "You can check the status with: launchctl list com.rrainn.cronr"
