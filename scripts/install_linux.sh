@@ -79,6 +79,30 @@ if [ -z "$CARGO_BIN" ]; then
 	exit 1
 fi
 
+# Ensure a C linker is available. Rust needs `cc` to link binaries. On a
+# minimal system it may not be present, so we install the distro's build
+# toolchain package automatically before attempting to compile.
+if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+	echo "C linker not found. Installing build toolchain..."
+	if command -v apt-get >/dev/null 2>&1; then
+		apt-get install -y build-essential
+	elif command -v dnf >/dev/null 2>&1; then
+		dnf install -y gcc
+	elif command -v yum >/dev/null 2>&1; then
+		yum install -y gcc
+	elif command -v apk >/dev/null 2>&1; then
+		apk add --no-cache gcc musl-dev
+	elif command -v pacman >/dev/null 2>&1; then
+		pacman -S --noconfirm base-devel
+	elif command -v zypper >/dev/null 2>&1; then
+		zypper install -y gcc
+	else
+		echo "Error: No supported package manager found (apt, dnf, yum, apk, pacman, zypper)."
+		echo "Please install a C compiler (e.g. gcc) manually, then re-run this script."
+		exit 1
+	fi
+fi
+
 echo "Building release binary as $REAL_USER (using $CARGO_BIN)..."
 cd "$REPO_ROOT"
 # Prepend cargo's own directory to PATH so cargo can locate rustc and other
