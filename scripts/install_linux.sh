@@ -9,6 +9,17 @@ if [ "$EUID" -ne 0 ]; then
 	exit 1
 fi
 
+# Detect direct root login vs. sudo invocation. When run directly as root
+# (e.g. after `su -` or as the root user in a container) SUDO_USER is unset,
+# so we cannot reliably locate a per-user cargo installation. Require the
+# caller to use `sudo` from their normal account instead.
+if [ -z "${SUDO_USER:-}" ] && [ "${USER:-root}" = "root" ]; then
+	echo "Error: Please run this script with sudo from your normal user account:"
+	echo "  sudo ./scripts/install_linux.sh"
+	echo "Running as root directly (e.g. via su) means cargo cannot be located."
+	exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY_SRC="$REPO_ROOT/target/release/cronr"
@@ -39,16 +50,32 @@ for candidate in \
 	"$REAL_HOME/.cargo/bin/cargo" \
 	"/home/linuxbrew/.linuxbrew/bin/cargo" \
 	"/usr/local/bin/cargo" \
-	"/usr/bin/cargo"; do
+	"/usr/bin/cargo" \
+	"/opt/rust/bin/cargo" \
+	"/opt/rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo" \
+	"/opt/rustup/toolchains/stable-aarch64-unknown-linux-gnu/bin/cargo"; do
 	if [ -x "$candidate" ]; then
 		CARGO_BIN="$candidate"
 		break
 	fi
 done
 
+# Last-resort: search all home directories for a cargo binary
+if [ -z "$CARGO_BIN" ]; then
+	for candidate in /home/*/.cargo/bin/cargo; do
+		if [ -x "$candidate" ]; then
+			CARGO_BIN="$candidate"
+			break
+		fi
+	done
+fi
+
 if [ -z "$CARGO_BIN" ]; then
 	echo "Error: Cannot find cargo for user $REAL_USER."
-	echo "Checked: ~/.cargo/bin, /home/linuxbrew/.linuxbrew/bin, /usr/local/bin, /usr/bin"
+	echo "Checked: ~/.cargo/bin, /home/linuxbrew/.linuxbrew/bin, /usr/local/bin, /usr/bin,"
+	echo "         /opt/rust/bin, /opt/rustup/toolchains/*/bin, /home/*/.cargo/bin"
+	echo "Install Rust via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+	echo "Then re-run: sudo ./scripts/install_linux.sh"
 	exit 1
 fi
 
