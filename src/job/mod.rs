@@ -145,6 +145,69 @@ impl Job {
         false
     }
 
+    /// Run the job as a one-off test, streaming output directly to the terminal.
+    ///
+    /// This mirrors the exact execution environment the daemon uses ([`Job::run`]):
+    /// - the same login shell from captured env
+    /// - the same captured environment variable overrides
+    /// - the same working directory (`data_dir`, matching the daemon's cwd set by `daemonize`)
+    /// - the same process-group isolation
+    ///
+    /// The only intentional differences are that `last_executed`/`next_run` are not
+    /// updated, and stdout/stderr are inherited from the calling terminal so the
+    /// user can see the output directly.
+    pub async fn run_test(&self, config: &Config) -> Result<i32> {
+        // Determine the user's shell (from captured env, or fall back to /bin/sh)
+        let shell = self
+            .env
+            .get("SHELL")
+            .map(|s| s.as_str())
+            .unwrap_or("/bin/sh");
+
+        // Run the command through a login shell, inheriting the terminal's
+        // stdin/stdout/stderr so that output is visible to the user directly.
+        // Set the working directory to data_dir to match the daemon process,
+        // which uses Daemonize::working_directory(&data_dir).
+        let mut command = Command::new(shell);
+        command
+            .args(["-l", "-c", &self.command])
+            .current_dir(config.data_dir())
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        // Apply captured env vars as overrides on top of the login shell env,
+        // matching the exact overrides the daemon applies in Job::run().
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+
+        // Isolate the child into its own process group so signals sent to the
+        // parent do not propagate to it unexpectedly — same as Job::run().
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                let _ = nix::unistd::setpgid(
+                    nix::unistd::Pid::from_raw(0),
+                    nix::unistd::Pid::from_raw(0),
+                );
+                Ok(())
+            });
+        }
+
+        // Spawn the child process
+        let mut child = command.spawn().map_err(|e| {
+            CronrError::JobExecutionError(format!("Failed to spawn command: {}", e))
+        })?;
+
+        // Wait for the child process to complete
+        let exit_status = child.wait().await.map_err(|e| {
+            CronrError::JobExecutionError(format!("Failed to wait for command: {}", e))
+        })?;
+
+        Ok(exit_status.code().unwrap_or(-1))
+    }
+
     /// Run the job
     pub async fn run(&mut self, config: &Config, job_id: usize) -> Result<()> {
         // Advance the schedule immediately to prevent tight retry loops on failure.

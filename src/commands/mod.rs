@@ -52,6 +52,13 @@ pub enum Commands {
     #[clap(name = "daemon-stop", hide = true)]
     DaemonStop,
 
+    /// Run a job immediately as a one-off test (does not affect the schedule)
+    #[clap(name = "run")]
+    Run {
+        /// The ID of the job to run
+        id: usize,
+    },
+
     /// Check the status of the daemon and tool
     #[clap(name = "status")]
     Status,
@@ -72,6 +79,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::List) => list_jobs(),
         Some(Commands::Stop { id }) => stop_job(id),
         Some(Commands::Version) => print_version(),
+        Some(Commands::Run { id }) => run_job_test(id),
         Some(Commands::Start) => start_daemon(),
         Some(Commands::DaemonStop) => stop_daemon(),
         Some(Commands::Status) => check_daemon_status(),
@@ -294,6 +302,49 @@ fn check_daemon_status() -> Result<()> {
         }
 
         // Return success
+        Ok(())
+    })
+}
+
+/// Run a job once immediately as a test, streaming output to the terminal.
+///
+/// The execution environment matches the daemon as closely as possible:
+/// - same login shell and captured env-var overrides
+/// - same working directory (`data_dir`, matching the cwd set by `daemonize`)
+/// - same process-group isolation
+///
+/// The job's `last_executed` and `next_run` fields are not modified.
+fn run_job_test(id: usize) -> Result<()> {
+    // Create the async runtime
+    let rt = Runtime::new().map_err(|e| {
+        CronrError::InitializationError(format!("Failed to create async runtime: {}", e))
+    })?;
+
+    // Run the async block
+    rt.block_on(async {
+        // Load the job manager from existing configuration
+        let job_manager = JobManager::load().await?;
+
+        // Retrieve the job by ID so we can display its command before running
+        let job = job_manager.get_job(id).await?;
+
+        println!("Running job {} one-off test:", id);
+        println!("  Command:  {}", job.command);
+        println!("  Schedule: {}", job.cron_expression);
+        println!("{}", "─".repeat(40));
+
+        // Execute the job using the same config the daemon would use, so the
+        // working directory and paths are identical to a scheduled run.
+        let exit_code = job.run_test(job_manager.config()).await?;
+
+        println!("{}", "─".repeat(40));
+
+        if exit_code == 0 {
+            println!("Job {} completed successfully (exit code 0).", id);
+        } else {
+            println!("Job {} exited with code {}.", id, exit_code);
+        }
+
         Ok(())
     })
 }

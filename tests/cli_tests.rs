@@ -213,3 +213,51 @@ fn test_status_command() {
     // Clean up
     temp_dir.close().unwrap();
 }
+
+// Test run command executes a job immediately without altering its schedule
+#[test]
+fn test_run_job_test() {
+    // Create a temporary directory for the test
+    let temp_dir = tempdir().unwrap();
+    let home_dir = temp_dir.path().to_path_buf();
+
+    // Ensure the .cronr directory doesn't exist
+    let cronr_dir = home_dir.join(".cronr");
+    if cronr_dir.exists() {
+        fs::remove_dir_all(&cronr_dir).unwrap();
+    }
+
+    // Create a job that echoes a known string
+    run_cronr_with_home(&["create", "echo hello_cronr_test", "0 * * * * *"], &home_dir)
+        .success()
+        .stdout(predicates::str::contains("Added job 0"));
+
+    // Run the job once as a test — should succeed and show the separator lines
+    run_cronr_with_home(&["run", "0"], &home_dir)
+        .success()
+        .stdout(predicates::str::contains("Running job 0 one-off test:"))
+        .stdout(predicates::str::contains("echo hello_cronr_test"))
+        .stdout(predicates::str::contains("completed successfully"));
+
+    // Clean up
+    temp_dir.close().unwrap();
+}
+
+// Test run command fails gracefully for a non-existent job ID
+#[test]
+fn test_run_invalid_job_id() {
+    // Create a temporary directory for the test
+    let temp_dir = tempdir().unwrap();
+    let home_dir = temp_dir.path().to_path_buf();
+
+    // Create one job so the data directory and jobs file exist
+    run_cronr_with_home(&["create", "echo test", "0 * * * * *"], &home_dir).success();
+
+    // Try to run a job with an ID that does not exist
+    run_cronr_with_home(&["run", "999"], &home_dir)
+        .failure()
+        .stderr(predicates::str::contains("Invalid job ID: 999"));
+
+    // Clean up
+    temp_dir.close().unwrap();
+}
