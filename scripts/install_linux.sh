@@ -54,7 +54,10 @@ fi
 
 echo "Building release binary as $REAL_USER (using $CARGO_BIN)..."
 cd "$REPO_ROOT"
-sudo -u "$REAL_USER" "$CARGO_BIN" build --release
+# Prepend cargo's own directory to PATH so cargo can locate rustc and other
+# toolchain binaries that live alongside it (e.g. in a linuxbrew install).
+CARGO_DIR="$(dirname "$CARGO_BIN")"
+sudo -u "$REAL_USER" env PATH="$CARGO_DIR:$PATH" "$CARGO_BIN" build --release
 
 # Stop the running service before replacing the binary to avoid "Text file busy"
 if systemctl is-active --quiet cronr.service 2>/dev/null; then
