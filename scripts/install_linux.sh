@@ -28,12 +28,33 @@ if [ "$UPGRADE" = false ] && [ -d "/root/.cronr" ]; then
 fi
 
 # Always build a fresh release binary so the installed version matches HEAD.
-# Run cargo as the invoking user because root's PATH typically does not
-# include the user-local cargo installation (e.g. ~/.cargo/bin or linuxbrew).
+# Run cargo as the invoking user because root's PATH typically does not include
+# the user-local cargo installation. We locate the binary directly rather than
+# relying on the login shell sourcing the right PATH init files.
 REAL_USER="${SUDO_USER:-$USER}"
-echo "Building release binary as $REAL_USER..."
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+
+CARGO_BIN=""
+for candidate in \
+	"$REAL_HOME/.cargo/bin/cargo" \
+	"/home/linuxbrew/.linuxbrew/bin/cargo" \
+	"/usr/local/bin/cargo" \
+	"/usr/bin/cargo"; do
+	if [ -x "$candidate" ]; then
+		CARGO_BIN="$candidate"
+		break
+	fi
+done
+
+if [ -z "$CARGO_BIN" ]; then
+	echo "Error: Cannot find cargo for user $REAL_USER."
+	echo "Checked: ~/.cargo/bin, /home/linuxbrew/.linuxbrew/bin, /usr/local/bin, /usr/bin"
+	exit 1
+fi
+
+echo "Building release binary as $REAL_USER (using $CARGO_BIN)..."
 cd "$REPO_ROOT"
-sudo -u "$REAL_USER" bash -lc "cd '$REPO_ROOT' && cargo build --release"
+sudo -u "$REAL_USER" "$CARGO_BIN" build --release
 
 # Stop the running service before replacing the binary to avoid "Text file busy"
 if systemctl is-active --quiet cronr.service 2>/dev/null; then
