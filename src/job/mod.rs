@@ -14,6 +14,25 @@ use crate::errors::CronrError;
 use crate::errors::Result;
 use crate::logger::Logger;
 
+/// The outcome of the most recent execution of a job
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobRunStatus {
+    /// The command exited with code 0
+    Success,
+    /// The command exited with a non-zero code or was killed by a signal
+    Failed(String),
+}
+
+impl std::fmt::Display for JobRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JobRunStatus::Success => write!(f, "Success"),
+            JobRunStatus::Failed(info) => write!(f, "Failed ({})", info),
+        }
+    }
+}
+
 /// A cron job
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -31,6 +50,10 @@ pub struct Job {
 
     /// The next run time (if any)
     pub next_run: Option<DateTime<Utc>>,
+
+    /// The status of the last run (if any)
+    #[serde(default)]
+    pub last_run_status: Option<JobRunStatus>,
 
     /// Environment variables captured when the job was created
     /// This ensures jobs run with the user's PATH and other important env vars
@@ -64,6 +87,7 @@ impl Job {
             enabled: true,
             last_executed: None,
             next_run,
+            last_run_status: None,
             env,
         })
     }
@@ -294,6 +318,8 @@ impl Job {
         // Check exit status and return an error for non-zero exits
         if output.status.success() {
             log::info!("Job {} command exited successfully", job_id);
+            // Record successful run status so `cronr info` can display it
+            self.last_run_status = Some(JobRunStatus::Success);
             Ok(())
         } else {
             let exit_info = output
@@ -305,6 +331,9 @@ impl Job {
                 job_id,
                 exit_info
             );
+            // Record failed run status before returning the error so that
+            // `config.update_job_state` (called by the executor) persists it
+            self.last_run_status = Some(JobRunStatus::Failed(exit_info.clone()));
             Err(CronrError::JobExecutionError(format!(
                 "Command exited with status: {}",
                 exit_info
@@ -562,6 +591,87 @@ mod tests {
             stdout_log.contains("hello_from_shell"),
             "Expected stdout log to contain command output, got: {}",
             stdout_log
+        );
+    }
+
+    /// Test that a freshly created job has no last run status.
+    #[test]
+    fn test_new_job_has_no_last_run_status() {
+        // A brand-new job should not have any run status recorded
+        let job = Job::new("echo test".to_string(), "0 * * * * *".to_string()).unwrap();
+        assert!(
+            job.last_run_status.is_none(),
+            "Expected no last_run_status on a new job"
+        );
+    }
+
+    /// Test that last_run_status is set to Success after a successful run.
+    #[tokio::test]
+    async fn test_last_run_status_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+
+        let mut job = Job::new("true".to_string(), "0 * * * * *".to_string()).unwrap();
+
+        // Run the job — `true` always exits with 0
+        let result = job.run(&config, 0).await;
+        assert!(result.is_ok(), "Expected 'true' to succeed: {:?}", result);
+
+        // Status should be recorded as Success
+        assert_eq!(
+            job.last_run_status,
+            Some(JobRunStatus::Success),
+            "Expected last_run_status to be Success after a successful run"
+        );
+    }
+
+    /// Test that last_run_status is set to Failed after a non-zero exit.
+    #[tokio::test]
+    async fn test_last_run_status_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+
+        let mut job = Job::new("false".to_string(), "0 * * * * *".to_string()).unwrap();
+
+        // Run the job — `false` always exits with 1
+        let result = job.run(&config, 0).await;
+        assert!(result.is_err(), "Expected 'false' to fail");
+
+        // Status should be recorded as Failed with the exit code
+        match &job.last_run_status {
+            Some(JobRunStatus::Failed(info)) => {
+                assert_eq!(info, "1", "Expected exit code '1' in Failed status");
+            }
+            other => panic!("Expected last_run_status to be Failed(\"1\"), got {:?}", other),
+        }
+    }
+
+    /// Test that last_run_status is serialized and deserialized correctly.
+    #[test]
+    fn test_last_run_status_serde_roundtrip() {
+        let mut job = Job::new("echo test".to_string(), "0 * * * * *".to_string()).unwrap();
+
+        // Set a Success status and round-trip through JSON
+        job.last_run_status = Some(JobRunStatus::Success);
+        let json = serde_json::to_string(&job).unwrap();
+        let deserialized: Job = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.last_run_status, Some(JobRunStatus::Success));
+
+        // Set a Failed status and round-trip through JSON
+        job.last_run_status = Some(JobRunStatus::Failed("42".to_string()));
+        let json = serde_json::to_string(&job).unwrap();
+        let deserialized: Job = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.last_run_status,
+            Some(JobRunStatus::Failed("42".to_string()))
+        );
+
+        // An older job JSON without the field should deserialize with None
+        let legacy_json = r#"{"command":"echo test","cron_expression":"0 * * * * *","enabled":true,"last_executed":null,"next_run":null,"env":{}}"#;
+        let legacy: Job = serde_json::from_str(legacy_json).unwrap();
+        assert!(
+            legacy.last_run_status.is_none(),
+            "Legacy jobs without last_run_status should default to None"
         );
     }
 

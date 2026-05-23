@@ -63,6 +63,13 @@ pub enum Commands {
     #[clap(name = "status")]
     Status,
 
+    /// Show details about a specific job
+    #[clap(name = "info")]
+    Info {
+        /// The ID of the job to inspect
+        id: usize,
+    },
+
     /// Internal command used by the daemon process
     #[clap(name = "daemon-internal", hide = true)]
     DaemonInternal,
@@ -83,6 +90,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::Start) => start_daemon(),
         Some(Commands::DaemonStop) => stop_daemon(),
         Some(Commands::Status) => check_daemon_status(),
+        Some(Commands::Info { id }) => info_job(id),
         Some(Commands::DaemonInternal) => run_daemon_internal(),
         None => {
             // If no command is provided, show help
@@ -344,6 +352,54 @@ fn run_job_test(id: usize) -> Result<()> {
         } else {
             println!("Job {} exited with code {}.", id, exit_code);
         }
+
+        Ok(())
+    })
+}
+
+/// Show detailed information about a specific cron job
+fn info_job(id: usize) -> Result<()> {
+    // Create the async runtime
+    let rt = Runtime::new().map_err(|e| {
+        CronrError::InitializationError(format!("Failed to create async runtime: {}", e))
+    })?;
+
+    // Run the async block
+    rt.block_on(async {
+        // Load the job manager from existing configuration
+        let job_manager = JobManager::load().await?;
+
+        // Retrieve the job by ID
+        let job = job_manager.get_job(id).await?;
+
+        // Format the last run time
+        let last_run = job
+            .last_executed
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "Never".to_string());
+
+        // Format the next run time
+        let next_run = job
+            .next_run
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "N/A".to_string());
+
+        // Format the status of the last run
+        let last_run_status = job
+            .last_run_status
+            .as_ref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "N/A".to_string());
+
+        // Print the job details
+        println!("Job {}", id);
+        println!("{}", "─".repeat(40));
+        println!("  ID:              {}", id);
+        println!("  Command:         {}", job.command);
+        println!("  Schedule:        {}", job.cron_expression);
+        println!("  Last Run:        {}", last_run);
+        println!("  Next Run:        {}", next_run);
+        println!("  Last Run Status: {}", last_run_status);
 
         Ok(())
     })

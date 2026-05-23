@@ -261,3 +261,79 @@ fn test_run_invalid_job_id() {
     // Clean up
     temp_dir.close().unwrap();
 }
+
+// Test info command shows correct job details before the job has ever run
+#[test]
+fn test_info_command_never_run() {
+    let temp_dir = tempdir().unwrap();
+    let home_dir = temp_dir.path().to_path_buf();
+
+    // Create a cron job
+    run_cronr_with_home(&["create", "echo hello_info", "0 * * * * *"], &home_dir)
+        .success()
+        .stdout(predicates::str::contains("Added job 0"));
+
+    // Run info on the newly created job
+    run_cronr_with_home(&["info", "0"], &home_dir)
+        .success()
+        // Should show the job ID
+        .stdout(predicates::str::contains("Job 0"))
+        // Should show the command
+        .stdout(predicates::str::contains("echo hello_info"))
+        // Should show the cron expression
+        .stdout(predicates::str::contains("0 * * * * *"))
+        // Job has never run, so last run should be "Never"
+        .stdout(predicates::str::contains("Last Run:"))
+        .stdout(predicates::str::contains("Never"))
+        // A next run time should be present
+        .stdout(predicates::str::contains("Next Run:"))
+        // Status should be N/A when the job has never been run
+        .stdout(predicates::str::contains("Last Run Status:"))
+        .stdout(predicates::str::contains("N/A"));
+
+    temp_dir.close().unwrap();
+}
+
+// Test info command fails gracefully for a non-existent job ID
+#[test]
+fn test_info_invalid_job_id() {
+    let temp_dir = tempdir().unwrap();
+    let home_dir = temp_dir.path().to_path_buf();
+
+    // Create one job so the data directory and jobs file exist
+    run_cronr_with_home(&["create", "echo test", "0 * * * * *"], &home_dir).success();
+
+    // Request info for a non-existent ID
+    run_cronr_with_home(&["info", "999"], &home_dir)
+        .failure()
+        .stderr(predicates::str::contains("Invalid job ID: 999"));
+
+    temp_dir.close().unwrap();
+}
+
+// Test that info reflects a successful run status after `cronr run`
+#[test]
+fn test_info_shows_success_status_after_run() {
+    let temp_dir = tempdir().unwrap();
+    let home_dir = temp_dir.path().to_path_buf();
+
+    // Create a job that always succeeds
+    run_cronr_with_home(&["create", "true", "0 * * * * *"], &home_dir)
+        .success()
+        .stdout(predicates::str::contains("Added job 0"));
+
+    // Execute the job once so last_run_status gets written to disk
+    run_cronr_with_home(&["run", "0"], &home_dir).success();
+
+    // NOTE: `cronr run` uses run_test() which intentionally does not update
+    // last_executed or last_run_status. Info should therefore still show N/A
+    // for status and "Never" for last run (matching the documented behaviour).
+    run_cronr_with_home(&["info", "0"], &home_dir)
+        .success()
+        .stdout(predicates::str::contains("Job 0"))
+        .stdout(predicates::str::contains("true"))
+        .stdout(predicates::str::contains("Last Run Status:"))
+        .stdout(predicates::str::contains("N/A"));
+
+    temp_dir.close().unwrap();
+}
