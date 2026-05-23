@@ -70,6 +70,17 @@ pub enum Commands {
         id: usize,
     },
 
+    /// Edit the cron schedule of an existing job
+    #[clap(name = "edit")]
+    Edit {
+        /// The ID of the job to edit
+        id: usize,
+
+        /// The new cron expression (e.g., "0 0 * * * *" for every hour on the hour)
+        #[clap(name = "schedule")]
+        cron_expression: String,
+    },
+
     /// Internal command used by the daemon process
     #[clap(name = "daemon-internal", hide = true)]
     DaemonInternal,
@@ -91,6 +102,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::DaemonStop) => stop_daemon(),
         Some(Commands::Status) => check_daemon_status(),
         Some(Commands::Info { id }) => info_job(id),
+        Some(Commands::Edit { id, cron_expression }) => edit_job(id, cron_expression),
         Some(Commands::DaemonInternal) => run_daemon_internal(),
         None => {
             // If no command is provided, show help
@@ -400,6 +412,34 @@ fn info_job(id: usize) -> Result<()> {
         println!("  Last Run:        {}", last_run);
         println!("  Next Run:        {}", next_run);
         println!("  Last Run Status: {}", last_run_status);
+
+        Ok(())
+    })
+}
+
+/// Edit the cron schedule of an existing job
+fn edit_job(id: usize, cron_expression: String) -> Result<()> {
+    // Create the async runtime
+    let rt = Runtime::new().map_err(|e| {
+        CronrError::InitializationError(format!("Failed to create async runtime: {}", e))
+    })?;
+
+    // Run the async block
+    rt.block_on(async {
+        // Load the job manager from existing configuration
+        let job_manager = JobManager::load().await?;
+
+        // Retrieve the current job by ID
+        let mut job = job_manager.get_job(id).await?;
+
+        // Update the cron schedule (validates the expression and recalculates next_run)
+        job.reschedule(cron_expression.clone())?;
+
+        // Persist the updated job
+        job_manager.update_job(id, job).await?;
+
+        // Confirm the change to the user
+        println!("Updated job {} schedule to '{}'", id, cron_expression);
 
         Ok(())
     })

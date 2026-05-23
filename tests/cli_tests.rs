@@ -311,6 +311,66 @@ fn test_info_invalid_job_id() {
     temp_dir.close().unwrap();
 }
 
+// Test edit command updates the cron schedule of an existing job
+#[test]
+fn test_edit_job_schedule() {
+    let temp_dir = tempdir().unwrap();
+    let home_dir = temp_dir.path().to_path_buf();
+
+    // Create a job with an initial schedule
+    run_cronr_with_home(&["create", "echo test", "0 * * * * *"], &home_dir)
+        .success()
+        .stdout(predicates::str::contains("Added job 0"));
+
+    // Edit the job's schedule to a new cron expression
+    run_cronr_with_home(&["edit", "0", "0 0 * * * *"], &home_dir)
+        .success()
+        .stdout(predicates::str::contains("Updated job 0"))
+        .stdout(predicates::str::contains("0 0 * * * *"));
+
+    // Verify the list shows the updated schedule
+    run_cronr_with_home(&["ls"], &home_dir)
+        .success()
+        .stdout(predicates::str::contains("0 0 * * * *"));
+
+    // Verify info also reflects the new schedule
+    run_cronr_with_home(&["info", "0"], &home_dir)
+        .success()
+        .stdout(predicates::str::contains("0 0 * * * *"));
+
+    temp_dir.close().unwrap();
+}
+
+// Test edit command fails for a non-existent job ID
+#[test]
+fn test_edit_invalid_job_id() {
+    let temp_dir = tempdir().unwrap();
+    let home_dir = temp_dir.path().to_path_buf();
+
+    // Create a job so the data directory exists
+    run_cronr_with_home(&["create", "echo test", "0 * * * * *"], &home_dir).success();
+
+    // Attempt to edit a non-existent job ID
+    run_cronr_with_home(&["edit", "99", "0 0 * * * *"], &home_dir).failure();
+
+    temp_dir.close().unwrap();
+}
+
+// Test edit command fails for an invalid cron expression
+#[test]
+fn test_edit_invalid_cron_expression() {
+    let temp_dir = tempdir().unwrap();
+    let home_dir = temp_dir.path().to_path_buf();
+
+    // Create a valid job first
+    run_cronr_with_home(&["create", "echo test", "0 * * * * *"], &home_dir).success();
+
+    // Attempt to edit with a bad cron expression
+    run_cronr_with_home(&["edit", "0", "not-a-cron-expression"], &home_dir).failure();
+
+    temp_dir.close().unwrap();
+}
+
 // Test that info reflects a successful run status after `cronr run`
 #[test]
 fn test_info_shows_success_status_after_run() {

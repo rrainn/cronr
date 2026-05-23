@@ -287,25 +287,25 @@ impl JobManager {
         jobs.clone()
     }
 
-    /// Update a job
-    // pub async fn update_job(&self, id: usize, job: Job) -> Result<()> {
-    // 	// Get the jobs
-    // 	let mut jobs = self.jobs.lock().await;
+    /// Update a job in-place and persist the change to disk
+    pub async fn update_job(&self, id: usize, job: Job) -> Result<()> {
+        // Lock the jobs map
+        let mut jobs = self.jobs.lock().await;
 
-    // 	// Check if the job exists
-    // 	if !jobs.contains_key(&id) {
-    // 		return Err(CronrError::InvalidJobId(id));
-    // 	}
+        // Check if the job exists
+        if !jobs.contains_key(&id) {
+            return Err(CronrError::InvalidJobId(id));
+        }
 
-    // 	// Update the job
-    // 	jobs.insert(id, job);
+        // Replace the existing job entry
+        jobs.insert(id, job);
 
-    // 	// Save the jobs
-    // 	drop(jobs);
-    // 	self.save_jobs().await?;
+        // Persist to disk (drop the lock first to avoid holding it across I/O)
+        drop(jobs);
+        self.save_jobs().await?;
 
-    // 	Ok(())
-    // }
+        Ok(())
+    }
 
     /// Remove a job
     pub async fn remove_job(&self, id: usize) -> Result<()> {

@@ -97,6 +97,20 @@ impl Job {
         &self.command
     }
 
+    /// Update the cron expression and recalculate the next run time
+    pub fn reschedule(&mut self, cron_expression: String) -> Result<()> {
+        // Validate the new cron expression by parsing it
+        let schedule = cron_expression
+            .parse::<Schedule>()
+            .map_err(|e| CronrError::InvalidCronExpression(e.to_string()))?;
+
+        // Apply the new expression and recalculate next run
+        self.cron_expression = cron_expression;
+        self.next_run = schedule.upcoming(Utc).next();
+
+        Ok(())
+    }
+
     /// Set the job as run at the current time
     pub fn set_as_run(&mut self) {
         // Set the last run time to now
