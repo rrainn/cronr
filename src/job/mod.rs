@@ -14,6 +14,30 @@ use crate::errors::CronrError;
 use crate::errors::Result;
 use crate::logger::Logger;
 
+/// Normalize a cron expression so it is always in the 6-field format expected
+/// by the `cron` crate (seconds, minutes, hours, day-of-month, month, day-of-week).
+///
+/// Standard 5-field cron expressions omit the leading seconds field.  When only
+/// 5 fields are present the function prepends `"0 "` so the job fires at second 0
+/// of each matching minute rather than every second.
+fn normalize_cron_expression(expr: &str) -> String {
+	// Count whitespace-delimited tokens; 5 tokens → standard cron, prepend seconds.
+	let field_count = expr.split_whitespace().count();
+	if field_count == 5 {
+		format!("0 {}", expr)
+	} else {
+		expr.to_string()
+	}
+}
+
+/// Parse a cron expression into a [`Schedule`], accepting both the standard
+/// 5-field format and the 6-field (seconds-prefixed) format used by the `cron` crate.
+fn parse_cron_schedule(expr: &str) -> Result<Schedule> {
+	normalize_cron_expression(expr)
+		.parse::<Schedule>()
+		.map_err(|e| CronrError::InvalidCronExpression(e.to_string()))
+}
+
 /// The outcome of the most recent execution of a job
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -64,10 +88,8 @@ pub struct Job {
 impl Job {
     /// Create a new job
     pub fn new(command: String, cron_expression: String) -> Result<Self> {
-        // Parse the cron expression to validate it
-        let schedule = cron_expression
-            .parse::<Schedule>()
-            .map_err(|e| CronrError::InvalidCronExpression(e.to_string()))?;
+        // Parse the cron expression to validate it (normalizes 5-field expressions)
+        let schedule = parse_cron_schedule(&cron_expression)?;
 
         // Calculate the next run time
         let next_run = schedule.upcoming(Utc).next();
@@ -99,10 +121,8 @@ impl Job {
 
     /// Update the cron expression and recalculate the next run time
     pub fn reschedule(&mut self, cron_expression: String) -> Result<()> {
-        // Validate the new cron expression by parsing it
-        let schedule = cron_expression
-            .parse::<Schedule>()
-            .map_err(|e| CronrError::InvalidCronExpression(e.to_string()))?;
+        // Validate the new cron expression by parsing it (normalizes 5-field expressions)
+        let schedule = parse_cron_schedule(&cron_expression)?;
 
         // Apply the new expression and recalculate next run
         self.cron_expression = cron_expression;
@@ -116,8 +136,8 @@ impl Job {
         // Set the last run time to now
         self.last_executed = Some(Utc::now());
 
-        // Recalculate the next run time
-        let schedule = self.cron_expression.parse::<Schedule>().unwrap();
+        // Recalculate the next run time (normalizes 5-field expressions)
+        let schedule = parse_cron_schedule(&self.cron_expression).unwrap();
         self.next_run = schedule.upcoming(Utc).next();
     }
 
@@ -144,9 +164,9 @@ impl Job {
     pub fn enable(&mut self) {
         self.enabled = true;
 
-        // Recalculate the next run time
+        // Recalculate the next run time (normalizes 5-field expressions)
         if self.next_run.is_none() {
-            let schedule = self.cron_expression.parse::<Schedule>().unwrap();
+            let schedule = parse_cron_schedule(&self.cron_expression).unwrap();
             self.next_run = schedule.upcoming(Utc).next();
         }
     }
@@ -517,6 +537,37 @@ mod tests {
 
         // Check that the job creation failed
         assert!(job.is_err());
+    }
+
+    /// A standard 5-field cron expression (no seconds field) should be accepted and
+    /// treated as if seconds were set to 0, i.e. it fires at second 0 each minute.
+    #[test]
+    fn test_five_field_cron_accepted_as_zero_seconds() {
+        // 5-field expression: "* * * * *" (every minute, no seconds field)
+        let job = Job::new("echo test".to_string(), "* * * * *".to_string());
+        assert!(
+            job.is_ok(),
+            "5-field cron expression should be accepted without error"
+        );
+        let job = job.unwrap();
+
+        // The stored expression should remain exactly as the user typed it
+        assert_eq!(job.cron_expression(), "* * * * *");
+
+        // A next run time must be calculated, which proves the schedule was parsed correctly
+        assert!(
+            job.next_run().is_some(),
+            "next_run should be calculated for a 5-field expression"
+        );
+    }
+
+    /// normalize_cron_expression should prepend "0 " for 5-field expressions and
+    /// leave 6-field (and other) expressions unchanged.
+    #[test]
+    fn test_normalize_cron_expression() {
+        assert_eq!(normalize_cron_expression("* * * * *"), "0 * * * * *");
+        assert_eq!(normalize_cron_expression("0 * * * * *"), "0 * * * * *");
+        assert_eq!(normalize_cron_expression("30 0 12 * * *"), "30 0 12 * * *");
     }
 
     #[test]
