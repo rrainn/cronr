@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process;
 use tokio::runtime::Runtime;
 
@@ -84,6 +85,29 @@ pub enum Commands {
     /// Internal command used by the daemon process
     #[clap(name = "daemon-internal", hide = true)]
     DaemonInternal,
+
+    /// Show logs for a specific job
+    #[clap(name = "logs")]
+    Logs {
+        /// The ID of the job whose logs to display
+        id: usize,
+
+        /// Show stderr log instead of stdout
+        #[clap(long, short = 'e')]
+        stderr: bool,
+
+        /// Limit output to the last N lines (omit to show all)
+        #[clap(long, short = 'n', value_name = "N")]
+        lines: Option<usize>,
+
+        /// Stream (follow) new log output as it is written, like tail -f
+        #[clap(long, short = 'f')]
+        follow: bool,
+
+        /// Include run-boundary markers that show the timestamp of each run
+        #[clap(long, short = 't')]
+        timestamps: bool,
+    },
 }
 
 /// Run the command-line interface
@@ -104,6 +128,13 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::Info { id }) => info_job(id),
         Some(Commands::Edit { id, cron_expression }) => edit_job(id, cron_expression),
         Some(Commands::DaemonInternal) => run_daemon_internal(),
+        Some(Commands::Logs {
+            id,
+            stderr,
+            lines,
+            follow,
+            timestamps,
+        }) => show_logs(id, stderr, lines, follow, timestamps),
         None => {
             // If no command is provided, show help
             println!("cronr: cron task manager");
@@ -488,4 +519,292 @@ fn run_daemon_internal() -> Result<()> {
         // This should never return
         process::exit(0);
     })
+}
+
+// ─── logs command ────────────────────────────────────────────────────────────
+
+/// Run-boundary marker prefix used when writing log files.
+/// Lines that match this pattern are run headers or footers injected by the
+/// daemon; they are hidden unless `--timestamps` is passed.
+const RUN_MARKER_PREFIX: &str = "=== Run ";
+
+/// Return `true` when a line is a run-boundary marker (header or footer).
+fn is_run_marker(line: &str) -> bool {
+    line.starts_with(RUN_MARKER_PREFIX) && line.ends_with(" ===")
+}
+
+/// Apply display filters to raw log-file content.
+///
+/// * When `show_timestamps` is `false` the run-boundary marker lines are
+///   stripped from the output.
+/// * When `limit` is `Some(n)` only the last `n` lines of the (already
+///   filtered) output are returned.
+fn filter_log_lines(content: &str, show_timestamps: bool, limit: Option<usize>) -> String {
+    // Split into lines while preserving the line structure
+    let all_lines: Vec<&str> = content.lines().collect();
+
+    // Optionally strip run-marker lines
+    let filtered: Vec<&str> = if show_timestamps {
+        all_lines
+    } else {
+        all_lines
+            .into_iter()
+            .filter(|l| !is_run_marker(l))
+            .collect()
+    };
+
+    // Apply tail-style line limit
+    let visible: &[&str] = match limit {
+        Some(n) if n < filtered.len() => &filtered[filtered.len() - n..],
+        _ => &filtered,
+    };
+
+    if visible.is_empty() {
+        return String::new();
+    }
+
+    // Re-join lines and ensure a single trailing newline
+    format!("{}\n", visible.join("\n"))
+}
+
+/// Print logs for a job, applying the requested display options.
+///
+/// # Arguments
+///
+/// * `id`         – Job ID
+/// * `stderr`     – When `true`, show the stderr log; otherwise show stdout
+/// * `lines`      – Limit the initial output to the last N lines (`None` = all)
+/// * `follow`     – Continuously stream new log content (like `tail -f`)
+/// * `timestamps` – Show run-boundary marker lines that include timestamps
+fn show_logs(
+    id: usize,
+    stderr: bool,
+    lines: Option<usize>,
+    follow: bool,
+    timestamps: bool,
+) -> Result<()> {
+    use crate::config::Config;
+
+    // Load config to resolve log-file paths (no async needed; just reads paths)
+    let config = Config::load()?;
+
+    // Validate that the job exists so the user gets a meaningful error for an
+    // unknown ID rather than a generic "no logs" message
+    let rt = Runtime::new().map_err(|e| {
+        CronrError::InitializationError(format!("Failed to create async runtime: {}", e))
+    })?;
+    rt.block_on(async {
+        let job_manager = JobManager::load().await?;
+        // get_job returns an error for unknown IDs
+        job_manager.get_job(id).await?;
+        Ok::<_, CronrError>(())
+    })?;
+
+    // Resolve the log file path based on the --stderr flag
+    let log_path = if stderr {
+        config.stderr_log_path(id)
+    } else {
+        config.stdout_log_path(id)
+    };
+
+    let stream_label = if stderr { "stderr" } else { "stdout" };
+
+    // If the log file does not exist the job has not run yet
+    if !log_path.exists() {
+        println!("No {} logs found for job {}.", stream_label, id);
+        if follow {
+            println!("Waiting for job {} to produce {} output…", id, stream_label);
+        } else {
+            return Ok(());
+        }
+    }
+
+    // ── Initial output ────────────────────────────────────────────────────────
+
+    // Track the file position after the initial read so the follow loop can
+    // seek directly to the first unread byte
+    let mut pos: u64 = 0;
+
+    if log_path.exists() {
+        let raw = std::fs::read_to_string(&log_path).map_err(|e| {
+            CronrError::ConfigError(format!("Failed to read log file: {}", e))
+        })?;
+
+        let output = filter_log_lines(&raw, timestamps, lines);
+        print!("{}", output);
+        let _ = io::stdout().flush();
+
+        // Record the current end-of-file position so the follow loop resumes
+        // from here without re-printing already-seen content
+        pos = std::fs::metadata(&log_path)
+            .map_err(|e| CronrError::ConfigError(format!("Failed to stat log file: {}", e)))?
+            .len();
+    }
+
+    // ── Follow / streaming mode ───────────────────────────────────────────────
+
+    if follow {
+        println!("--- streaming {} logs for job {} (Ctrl-C to stop) ---", stream_label, id);
+        let _ = io::stdout().flush();
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+
+            // The file may not exist yet if the job has never run
+            if !log_path.exists() {
+                continue;
+            }
+
+            let new_size = match std::fs::metadata(&log_path) {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+
+            if new_size < pos {
+                // Log was rotated / truncated; restart from the beginning
+                pos = 0;
+            }
+
+            if new_size == pos {
+                // No new bytes written since last check
+                continue;
+            }
+
+            // Read only the new bytes that appeared since the last check
+            let mut file = std::fs::File::open(&log_path).map_err(|e| {
+                CronrError::ConfigError(format!("Failed to open log file: {}", e))
+            })?;
+            file.seek(SeekFrom::Start(pos)).map_err(|e| {
+                CronrError::ConfigError(format!("Failed to seek log file: {}", e))
+            })?;
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).map_err(|e| {
+                CronrError::ConfigError(format!("Failed to read log file: {}", e))
+            })?;
+
+            pos = new_size;
+
+            // Convert to string, filter markers if needed, then print
+            if let Ok(chunk) = String::from_utf8(buf) {
+                let output = filter_log_lines(&chunk, timestamps, None);
+                print!("{}", output);
+                let _ = io::stdout().flush();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ─── tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a realistic multi-run log file for use in several tests.
+    fn sample_log() -> String {
+        [
+            "=== Run started at 2024-01-15T10:00:00Z ===",
+            "first run output",
+            "second line",
+            "",
+            "=== Run ended at 2024-01-15T10:00:01Z (exit: 0) ===",
+            "",
+            "=== Run started at 2024-01-15T11:00:00Z ===",
+            "second run output",
+            "=== Run ended at 2024-01-15T11:00:02Z (exit: 1) ===",
+            "",
+        ]
+        .join("\n")
+    }
+
+    // ── is_run_marker ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_run_marker_detects_header() {
+        assert!(is_run_marker("=== Run started at 2024-01-15T10:00:00Z ==="));
+    }
+
+    #[test]
+    fn test_is_run_marker_detects_footer() {
+        assert!(is_run_marker(
+            "=== Run ended at 2024-01-15T10:00:01Z (exit: 0) ==="
+        ));
+    }
+
+    #[test]
+    fn test_is_run_marker_rejects_normal_lines() {
+        assert!(!is_run_marker("hello world"));
+        assert!(!is_run_marker("=== not a marker"));
+        assert!(!is_run_marker("Run started at something ==="));
+    }
+
+    // ── filter_log_lines – timestamps off ─────────────────────────────────────
+
+    #[test]
+    fn test_filter_strips_markers_by_default() {
+        let log = sample_log();
+        let result = filter_log_lines(&log, false, None);
+
+        // Marker lines must not appear in the output
+        assert!(!result.contains("=== Run"));
+        // Payload lines must be preserved
+        assert!(result.contains("first run output"));
+        assert!(result.contains("second run output"));
+    }
+
+    #[test]
+    fn test_filter_applies_line_limit() {
+        let log = sample_log();
+        // Request only the last 1 non-marker line; blank separator lines still count
+        let result = filter_log_lines(&log, false, Some(1));
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "second run output");
+    }
+
+    #[test]
+    fn test_filter_limit_larger_than_content_shows_all() {
+        let log = sample_log();
+        let result_limited = filter_log_lines(&log, false, Some(9999));
+        let result_unlimited = filter_log_lines(&log, false, None);
+        assert_eq!(result_limited, result_unlimited);
+    }
+
+    // ── filter_log_lines – timestamps on ──────────────────────────────────────
+
+    #[test]
+    fn test_filter_preserves_markers_when_timestamps_on() {
+        let log = sample_log();
+        let result = filter_log_lines(&log, true, None);
+
+        assert!(result.contains("=== Run started at 2024-01-15T10:00:00Z ==="));
+        assert!(result.contains("=== Run ended at 2024-01-15T11:00:02Z (exit: 1) ==="));
+        assert!(result.contains("first run output"));
+    }
+
+    #[test]
+    fn test_filter_timestamps_with_line_limit() {
+        let log = sample_log();
+        // Ask for just 2 lines (markers count toward the limit when timestamps is on)
+        let result = filter_log_lines(&log, true, Some(2));
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+    }
+
+    // ── edge cases ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_empty_content_returns_empty() {
+        assert_eq!(filter_log_lines("", false, None), "");
+        assert_eq!(filter_log_lines("", true, None), "");
+    }
+
+    #[test]
+    fn test_filter_output_ends_with_newline() {
+        let log = "line one\nline two\n";
+        let result = filter_log_lines(log, false, None);
+        assert!(result.ends_with('\n'));
+    }
 }

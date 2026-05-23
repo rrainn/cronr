@@ -129,6 +129,37 @@ impl Logger {
         self.write_log(&self.stderr_path, data)
     }
 
+    /// Write a run-start header line to the stdout log.
+    ///
+    /// The header is always terminated with a newline so it occupies its own line
+    /// even when the file was non-empty before this call.
+    pub fn write_stdout_run_header(&self, timestamp: &str) -> Result<()> {
+        let header = format!("=== Run started at {} ===\n", timestamp);
+        self.write_log(&self.stdout_path, header.as_bytes())
+    }
+
+    /// Write a run-start header line to the stderr log.
+    pub fn write_stderr_run_header(&self, timestamp: &str) -> Result<()> {
+        let header = format!("=== Run started at {} ===\n", timestamp);
+        self.write_log(&self.stderr_path, header.as_bytes())
+    }
+
+    /// Write a run-end footer line to the stdout log.
+    ///
+    /// A leading newline is included so the footer lands on its own line even
+    /// when the preceding output does not end with a newline.  A trailing blank
+    /// line visually separates successive runs.
+    pub fn write_stdout_run_footer(&self, timestamp: &str, exit_info: &str) -> Result<()> {
+        let footer = format!("\n=== Run ended at {} (exit: {}) ===\n\n", timestamp, exit_info);
+        self.write_log(&self.stdout_path, footer.as_bytes())
+    }
+
+    /// Write a run-end footer line to the stderr log.
+    pub fn write_stderr_run_footer(&self, timestamp: &str, exit_info: &str) -> Result<()> {
+        let footer = format!("\n=== Run ended at {} (exit: {}) ===\n\n", timestamp, exit_info);
+        self.write_log(&self.stderr_path, footer.as_bytes())
+    }
+
     /// Write to a log file with rotation check
     fn write_log(&self, path: &PathBuf, data: &[u8]) -> Result<()> {
         // Check if the log file needs rotation

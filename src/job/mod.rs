@@ -284,6 +284,12 @@ impl Job {
             config.log_rotation().clone(),
         );
 
+        // Record run-start timestamp and write marker lines to both log files so
+        // `cronr logs --timestamps` can show per-run boundaries.
+        let run_start_ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        logger.write_stdout_run_header(&run_start_ts)?;
+        logger.write_stderr_run_header(&run_start_ts)?;
+
         // Determine the user's shell (from captured env, or fall back to /bin/sh)
         let shell = self
             .env
@@ -344,10 +350,28 @@ impl Job {
             }
         };
 
+        // Determine exit info string before branching so it can be used in the
+        // run footer regardless of success/failure.
+        let exit_info = if output.status.success() {
+            "0".to_string()
+        } else {
+            output
+                .status
+                .code()
+                .map_or("signal".to_string(), |c| c.to_string())
+        };
+
+        // Record run end timestamp for the footer marker
+        let run_end_ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
         // Always write stdout/stderr logs regardless of exit status,
-        // so diagnostic output is available for failed jobs too
+        // so diagnostic output is available for failed jobs too.
+        // Each run is bracketed by a header (written before spawning) and a
+        // footer (written here) so `cronr logs --timestamps` can demarcate runs.
         logger.write_stdout(&output.stdout)?;
         logger.write_stderr(&output.stderr)?;
+        logger.write_stdout_run_footer(&run_end_ts, &exit_info)?;
+        logger.write_stderr_run_footer(&run_end_ts, &exit_info)?;
 
         // Check exit status and return an error for non-zero exits
         if output.status.success() {
@@ -356,10 +380,6 @@ impl Job {
             self.last_run_status = Some(JobRunStatus::Success);
             Ok(())
         } else {
-            let exit_info = output
-                .status
-                .code()
-                .map_or("signal".to_string(), |c| c.to_string());
             log::warn!(
                 "Job {} command exited with status: {}",
                 job_id,
