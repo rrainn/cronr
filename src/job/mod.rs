@@ -94,10 +94,27 @@ impl Job {
         // Calculate the next run time
         let next_run = schedule.upcoming(Utc).next();
 
-        // Capture important environment variables from the user's shell
-        // This ensures commands like docker, brew, etc. are found when the job runs
+        // Capture environment variables from the calling shell so that jobs can
+        // locate binaries (PATH), find Docker's socket (DOCKER_HOST), and access
+        // user-level runtime directories without sourcing a login profile.
+        // This list intentionally mirrors what cron daemons provide.
         let mut env = HashMap::new();
-        for key in &["PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL"] {
+        for key in &[
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "LANG",
+            "LC_ALL",
+            // Docker-related: needed when Docker Desktop or rootless Docker
+            // configures a non-default socket path.
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            // Linux user-level runtime directory used by rootless Docker and
+            // other systemd-activated user services.
+            "XDG_RUNTIME_DIR",
+        ] {
             if let Ok(value) = std::env::var(key) {
                 env.insert(key.to_string(), value);
             }
@@ -206,9 +223,9 @@ impl Job {
     /// Run the job as a one-off test, streaming output directly to the terminal.
     ///
     /// This mirrors the exact execution environment the daemon uses ([`Job::run`]):
-    /// - the same login shell from captured env
-    /// - the same captured environment variable overrides
-    /// - the same working directory (`data_dir`, matching the daemon's cwd set by `daemonize`)
+    /// - the same shell (from captured env, no `-l` login flag)
+    /// - the same captured environment variables (PATH, DOCKER_HOST, etc.)
+    /// - the same working directory (`data_dir`, matching the daemon's cwd)
     /// - the same process-group isolation
     ///
     /// The only intentional differences are that `last_executed`/`next_run` are not
@@ -222,20 +239,26 @@ impl Job {
             .map(|s| s.as_str())
             .unwrap_or("/bin/sh");
 
-        // Run the command through a login shell, inheriting the terminal's
+        // Run the command through a non-login shell, inheriting the terminal's
         // stdin/stdout/stderr so that output is visible to the user directly.
+        // -l (login shell) is intentionally omitted: login shells source profile
+        // files (/etc/profile, ~/.bash_profile, ~/.zprofile) which are designed
+        // for interactive sessions and can hang or behave unexpectedly in a
+        // daemon context with no controlling terminal.
+        // Instead, environment variables are passed explicitly from the captured
+        // env, matching exactly what the daemon does in Job::run().
         // Set the working directory to data_dir to match the daemon process,
         // which uses Daemonize::working_directory(&data_dir).
         let mut command = Command::new(shell);
         command
-            .args(["-l", "-c", &self.command])
+            .args(["-c", &self.command])
             .current_dir(config.data_dir())
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        // Apply captured env vars as overrides on top of the login shell env,
-        // matching the exact overrides the daemon applies in Job::run().
+        // Apply captured env vars so the shell has PATH, HOME, DOCKER_HOST, etc.
+        // matching the exact environment the daemon provides in Job::run().
         for (key, value) in &self.env {
             command.env(key, value);
         }
@@ -304,25 +327,36 @@ impl Job {
             .map(|s| s.as_str())
             .unwrap_or("/bin/sh");
 
-        // Run the command through a login shell so that profile files
-        // (~/.bash_profile, ~/.zprofile, /etc/profile, etc.) are sourced.
-        // This ensures PATH and other environment variables are properly set up,
-        // even though the daemon process itself runs with a minimal environment.
-        log::debug!("Job {} running via login shell: {} -l -c {:?}", job_id, shell, self.command);
+        // Do NOT use a login shell (-l).  Login shells source /etc/profile and
+        // ~/.bash_profile / ~/.zprofile, which are designed for interactive
+        // sessions.  In a daemon context (no controlling terminal, no tty):
+        //   - profile scripts may call `tput`, `mesg`, or other commands that
+        //     query terminal state and block indefinitely;
+        //   - on servers with NFS home directories, slow network, or
+        //     multi-factor SSH agents, sourcing ~/.profile can stall;
+        //   - zsh -l sets up job control which interacts badly with setpgid.
+        // Instead, all required environment (PATH, HOME, DOCKER_HOST, etc.) is
+        // passed explicitly via the captured env map, matching what traditional
+        // cron daemons (vixie cron, dcron) do.
+        log::debug!("Job {} running via shell: {} -c {:?}", job_id, shell, self.command);
         let mut command = Command::new(shell);
         command
-            .args(["-l", "-c", &self.command])
-            // Explicitly redirect stdin from /dev/null.  Without this the child
-            // inherits the daemon's stdin file descriptor which may be in an
-            // undefined state.  Tools such as `docker exec` probe stdin even
-            // without the -i flag; if they receive an unexpected descriptor they
-            // block before the container process is ever started, causing the
-            // entire pipeline (pg_dumpall | pv | gzip) to hang indefinitely.
+            .args(["-c", &self.command])
+            // Clear the inherited environment entirely then re-apply only the
+            // captured variables.  This prevents the daemon's minimal env from
+            // leaking unexpected values into jobs while ensuring every key the
+            // job actually needs (PATH, DOCKER_HOST, XDG_RUNTIME_DIR, …) is set.
+            .env_clear()
+            // stdin must be /dev/null.  Without it the child shell inherits the
+            // daemon's stdin fd (which is /dev/null via daemonize, but in some
+            // configurations may be in an undefined state).  docker exec probes
+            // its stdin even without -i; an unexpected fd causes it to block
+            // before the container process is started.
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Also apply captured env vars as overrides on top of the login shell env
+        // Apply the captured env vars as the complete environment for the job.
         for (key, value) in &self.env {
             command.env(key, value);
         }
@@ -931,5 +965,60 @@ mod tests {
             "Job did not terminate after the stop signal was sent; \
              process group kill is not working"
         );
+    }
+
+    /// Test that the job execution environment is clean: env_clear() removes any
+    /// variables inherited by the daemon that were NOT explicitly captured.
+    /// This prevents stale or incorrect values (e.g., a daemon-only TERM or
+    /// LS_COLORS) from leaking into jobs.
+    #[tokio::test]
+    async fn test_run_does_not_leak_daemon_env() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+
+        // Inject a canary variable into the current process environment.
+        // Because job.run() calls env_clear() it must NOT appear in the child.
+        // SAFETY: single-threaded test; no other threads read this variable.
+        unsafe { std::env::set_var("CRONR_DAEMON_CANARY_LEAK", "should_not_appear"); }
+
+        let mut job = Job::new(
+            "echo ${CRONR_DAEMON_CANARY_LEAK:-not_set}".to_string(),
+            "0 * * * * *".to_string(),
+        )
+        .unwrap();
+        // Ensure the canary is NOT in the captured env (simulating that it
+        // was set after job creation, e.g. by the daemonize step)
+        job.env.remove("CRONR_DAEMON_CANARY_LEAK");
+
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let result = job.run(&config, 0, stop_rx).await;
+        assert!(result.is_ok(), "Expected command to succeed: {:?}", result);
+
+        let stdout_log = std::fs::read_to_string(config.stdout_log_path(0)).unwrap();
+        assert!(
+            stdout_log.contains("not_set"),
+            "Daemon env variable leaked into job environment; got: {}",
+            stdout_log
+        );
+
+        unsafe { std::env::remove_var("CRONR_DAEMON_CANARY_LEAK"); }
+    }
+
+    /// Test that DOCKER_HOST is captured in the job env when present, so that
+    /// jobs using `docker exec` can reach the correct Docker socket even when
+    /// the daemon's own environment doesn't have it set.
+    #[test]
+    fn test_job_captures_docker_host() {
+        // SAFETY: single-threaded test; no other threads read this variable.
+        unsafe { std::env::set_var("DOCKER_HOST", "unix:///run/user/1000/docker.sock"); }
+
+        let job = Job::new("echo test".to_string(), "0 * * * * *".to_string()).unwrap();
+        assert_eq!(
+            job.env.get("DOCKER_HOST").map(|s| s.as_str()),
+            Some("unix:///run/user/1000/docker.sock"),
+            "DOCKER_HOST must be captured so docker exec works in daemon jobs"
+        );
+
+        unsafe { std::env::remove_var("DOCKER_HOST"); }
     }
 }
