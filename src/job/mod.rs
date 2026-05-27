@@ -263,18 +263,23 @@ impl Job {
             command.env(key, value);
         }
 
-        // Isolate the child into its own process group so signals sent to the
-        // parent do not propagate to it unexpectedly — same as Job::run().
-        #[cfg(unix)]
-        unsafe {
-            command.pre_exec(|| {
-                let _ = nix::unistd::setpgid(
-                    nix::unistd::Pid::from_raw(0),
-                    nix::unistd::Pid::from_raw(0),
-                );
-                Ok(())
-            });
-        }
+        // Do NOT call setpgid here (unlike Job::run).
+        //
+        // In the daemon context, setpgid(0,0) isolates the job's process group
+        // from the daemon's group so that signals sent to the daemon don't reach
+        // job children.
+        //
+        // In an interactive `cronr run` context, placing the child in a NEW
+        // process group detaches it from the terminal's FOREGROUND process group.
+        // Any child that calls tcsetattr on its inherited stdin fd (e.g.
+        // `docker compose exec` putting the terminal into raw mode to forward
+        // Ctrl+C transparently) receives SIGTTOU from the kernel because it is
+        // now a background process modifying terminal settings.  SIGTTOU suspends
+        // the process — so docker compose exec hangs before it ever exec's
+        // pg_dumpall inside the container, even with the -T flag.
+        //
+        // Leaving the child in the same process group as cronr keeps it in the
+        // terminal's foreground group so terminal ioctls work normally.
 
         // Spawn the child process
         let mut child = command.spawn().map_err(|e| {
