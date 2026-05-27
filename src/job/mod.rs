@@ -267,7 +267,14 @@ impl Job {
     }
 
     /// Run the job
-    pub async fn run(&mut self, config: &Config, job_id: usize) -> Result<()> {
+    /// Run the job.
+    ///
+    /// `stop_signal` allows the caller to interrupt a running job (e.g. on
+    /// daemon shutdown or job removal).  When the signal fires the entire
+    /// process group (shell + every pipeline child such as `docker exec`,
+    /// `pg_dumpall`, `pv`, `gzip`, …) is sent SIGTERM followed by SIGKILL so
+    /// no orphaned processes are left behind.
+    pub async fn run(&mut self, config: &Config, job_id: usize, mut stop_signal: watch::Receiver<bool>) -> Result<()> {
         // Advance the schedule immediately to prevent tight retry loops on failure.
         // Even if this execution fails, we should wait for the next scheduled time
         // rather than retrying immediately.
@@ -305,6 +312,13 @@ impl Job {
         let mut command = Command::new(shell);
         command
             .args(["-l", "-c", &self.command])
+            // Explicitly redirect stdin from /dev/null.  Without this the child
+            // inherits the daemon's stdin file descriptor which may be in an
+            // undefined state.  Tools such as `docker exec` probe stdin even
+            // without the -i flag; if they receive an unexpected descriptor they
+            // block before the container process is ever started, causing the
+            // entire pipeline (pg_dumpall | pv | gzip) to hang indefinitely.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -313,9 +327,10 @@ impl Job {
             command.env(key, value);
         }
 
-        // Create a new process group for the child process to isolate it from
-        // signals sent to the daemon's process group. This prevents signals from
-        // interrupting child process system calls (e.g., "Interrupted system call").
+        // Create a new process group for the child process.
+        // After setpgid(0, 0) the child's PGID equals its own PID, which lets us
+        // later call killpg(child_pid, SIG) to terminate the entire pipeline tree
+        // (shell + docker exec + pv + gzip + …) as a single unit on cancellation.
         #[cfg(unix)]
         unsafe {
             command.pre_exec(|| {
@@ -329,7 +344,7 @@ impl Job {
         }
 
         // Spawn the child process
-        let child = match command.spawn() {
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(e) => {
                 return Err(CronrError::JobExecutionError(format!(
@@ -339,24 +354,84 @@ impl Job {
             }
         };
 
-        // Wait for the child to complete asynchronously (non-blocking)
-        let output = match child.wait_with_output().await {
-            Ok(output) => output,
-            Err(e) => {
-                return Err(CronrError::JobExecutionError(format!(
-                    "Failed to wait for command: {}",
-                    e
-                )));
+        // After setpgid(0, 0) the child's PGID equals its PID.  Capture it now
+        // before partially moving `child` so we can signal the whole group later.
+        let child_pgid = child.id();
+        log::debug!("Job {} spawned shell PID/PGID {:?}", job_id, child_pgid);
+
+        // Drain stdout and stderr into memory in background tasks that run
+        // concurrently with the child.  Both pipes must be read continuously:
+        // if either pipe buffer fills up (typically 64 KiB) the child blocks
+        // mid-write, which stalls the entire pipeline including docker exec,
+        // pg_dumpall, and any downstream filters.
+        let child_stdout = child.stdout.take().expect("stdout was piped");
+        let child_stderr = child.stderr.take().expect("stderr was piped");
+
+        /// Drain an async reader to completion and return the bytes collected.
+        async fn drain<R: tokio::io::AsyncRead + Unpin>(reader: R) -> Vec<u8> {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = tokio::io::BufReader::new(reader).read_to_end(&mut buf).await;
+            buf
+        }
+
+        let stdout_task = tokio::spawn(drain(child_stdout));
+        let stderr_task = tokio::spawn(drain(child_stderr));
+
+        // Wait for the child to exit, or for a stop signal from the daemon.
+        // On a stop signal, kill the entire process group so no orphaned children
+        // (docker exec, pg_dumpall, gzip, …) are left behind.
+        let exit_status = tokio::select! {
+            result = child.wait() => {
+                result.map_err(|e| CronrError::JobExecutionError(
+                    format!("Failed to wait for command: {}", e)
+                ))?
+            }
+            _ = stop_signal.changed() => {
+                if *stop_signal.borrow() {
+                    log::info!(
+                        "Job {} received stop signal; terminating process group {:?}",
+                        job_id,
+                        child_pgid
+                    );
+                    #[cfg(unix)]
+                    if let Some(pgid) = child_pgid {
+                        // SIGTERM first — give processes a chance for graceful shutdown
+                        let _ = nix::sys::signal::killpg(
+                            nix::unistd::Pid::from_raw(pgid as i32),
+                            nix::sys::signal::Signal::SIGTERM,
+                        );
+                        // Brief grace period before force-killing
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        // SIGKILL as a backstop for anything still alive
+                        let _ = nix::sys::signal::killpg(
+                            nix::unistd::Pid::from_raw(pgid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                    }
+                    child.wait().await.map_err(|e| CronrError::JobExecutionError(
+                        format!("Failed to wait for command after kill: {}", e)
+                    ))?
+                } else {
+                    // Spurious change (value still false); keep waiting normally
+                    child.wait().await.map_err(|e| CronrError::JobExecutionError(
+                        format!("Failed to wait for command: {}", e)
+                    ))?
+                }
             }
         };
 
+        // Collect output; the drain tasks finish as soon as the child's pipes
+        // are closed by the OS (which happens when the child exits or is killed).
+        let stdout_data = stdout_task.await.unwrap_or_default();
+        let stderr_data = stderr_task.await.unwrap_or_default();
+
         // Determine exit info string before branching so it can be used in the
         // run footer regardless of success/failure.
-        let exit_info = if output.status.success() {
+        let exit_info = if exit_status.success() {
             "0".to_string()
         } else {
-            output
-                .status
+            exit_status
                 .code()
                 .map_or("signal".to_string(), |c| c.to_string())
         };
@@ -368,13 +443,13 @@ impl Job {
         // so diagnostic output is available for failed jobs too.
         // Each run is bracketed by a header (written before spawning) and a
         // footer (written here) so `cronr logs --timestamps` can demarcate runs.
-        logger.write_stdout(&output.stdout)?;
-        logger.write_stderr(&output.stderr)?;
+        logger.write_stdout(&stdout_data)?;
+        logger.write_stderr(&stderr_data)?;
         logger.write_stdout_run_footer(&run_end_ts, &exit_info)?;
         logger.write_stderr_run_footer(&run_end_ts, &exit_info)?;
 
         // Check exit status and return an error for non-zero exits
-        if output.status.success() {
+        if exit_status.success() {
             log::info!("Job {} command exited successfully", job_id);
             // Record successful run status so `cronr info` can display it
             self.last_run_status = Some(JobRunStatus::Success);
@@ -499,8 +574,9 @@ impl JobExecutor {
                 // Time to run the job
                 log::info!("Executing job {}: {}", id, job.command());
 
-                // Run the job
-                if let Err(e) = job.run(&config, id).await {
+                // Run the job, passing a clone of the stop signal so the run
+                // can kill its process group if the daemon shuts down mid-run.
+                if let Err(e) = job.run(&config, id, stop_signal.clone()).await {
                     log::error!("Failed to execute job {}: {}", id, e);
                 } else {
                     log::info!("Job {} executed successfully", id);
@@ -619,7 +695,8 @@ mod tests {
         let mut job = Job::new("false".to_string(), "0 * * * * *".to_string()).unwrap();
 
         // Run the job — `false` exits with status 1
-        let result = job.run(&config, 0).await;
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let result = job.run(&config, 0, stop_rx).await;
         assert!(
             result.is_err(),
             "Expected run() to return an error when the command exits with non-zero status"
@@ -646,7 +723,8 @@ mod tests {
         job.next_run = Some(past_time);
 
         // Run the job - should fail because the command doesn't exist
-        let result = job.run(&config, 0).await;
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let result = job.run(&config, 0, stop_rx).await;
         assert!(result.is_err(), "Expected job to fail with non-existent command");
 
         // After the fix: next_run should advance to the future to prevent tight retry loops
@@ -667,7 +745,8 @@ mod tests {
         // Use a command that only works when interpreted by a shell (echo is a shell builtin)
         let mut job = Job::new("echo hello_from_shell".to_string(), "0 * * * * *".to_string()).unwrap();
 
-        let result = job.run(&config, 0).await;
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let result = job.run(&config, 0, stop_rx).await;
         assert!(result.is_ok(), "Expected shell command to succeed: {:?}", result);
 
         // Verify stdout was captured to the log file
@@ -699,7 +778,8 @@ mod tests {
         let mut job = Job::new("true".to_string(), "0 * * * * *".to_string()).unwrap();
 
         // Run the job — `true` always exits with 0
-        let result = job.run(&config, 0).await;
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let result = job.run(&config, 0, stop_rx).await;
         assert!(result.is_ok(), "Expected 'true' to succeed: {:?}", result);
 
         // Status should be recorded as Success
@@ -719,7 +799,8 @@ mod tests {
         let mut job = Job::new("false".to_string(), "0 * * * * *".to_string()).unwrap();
 
         // Run the job — `false` always exits with 1
-        let result = job.run(&config, 0).await;
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let result = job.run(&config, 0, stop_rx).await;
         assert!(result.is_err(), "Expected 'false' to fail");
 
         // Status should be recorded as Failed with the exit code
@@ -770,7 +851,9 @@ mod tests {
         let mut job = Job::new("echo $CRONR_TEST_VAR".to_string(), "0 * * * * *".to_string()).unwrap();
         job.env.insert("CRONR_TEST_VAR".to_string(), "test_value_42".to_string());
 
-        let result = job.run(&config, 0).await;
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let result = job.run(&config, 0, stop_rx).await;
         assert!(result.is_ok(), "Expected command to succeed: {:?}", result);
 
         // Verify the env var was available inside the command
@@ -779,6 +862,74 @@ mod tests {
             stdout_log.contains("test_value_42"),
             "Expected stdout to contain env var value, got: {}",
             stdout_log
+        );
+    }
+
+    /// Test that job stdin is explicitly redirected from /dev/null so commands
+    /// that read stdin (like `cat` with no arguments) exit immediately instead of
+    /// blocking.  This also covers the docker exec hang: docker exec probes its
+    /// stdin even without -i; if the fd is inherited from the daemon in an
+    /// undefined state, docker exec blocks before the container process starts.
+    #[tokio::test]
+    async fn test_run_stdin_is_null() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+
+        // `cat` with no arguments reads stdin until EOF.
+        // With stdin=/dev/null it receives EOF immediately and exits 0.
+        // Without stdin=/dev/null it would block forever.
+        let mut job = Job::new("cat".to_string(), "0 * * * * *".to_string()).unwrap();
+
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+
+        // A generous timeout: if stdin is not /dev/null the test would hang here
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            job.run(&config, 0, stop_rx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "`cat` timed out — stdin was not /dev/null (job would block forever)"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "`cat` with stdin=/dev/null should exit 0"
+        );
+    }
+
+    /// Test that a running job's entire process group is killed when a stop
+    /// signal is delivered.  Without this, long-running pipelines (docker exec,
+    /// pg_dumpall, gzip, …) are left as orphans when the daemon shuts down.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_kills_process_group_on_stop_signal() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(temp_dir.path()).unwrap();
+
+        // `sleep 300` runs indefinitely; it will only exit when killed
+        let mut job = Job::new("sleep 300".to_string(), "0 * * * * *".to_string()).unwrap();
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+
+        // Trigger the stop signal after a short delay so the child has time to start
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            stop_tx.send(true).ok();
+        });
+
+        // The job should be terminated well within the SIGTERM+SIGKILL grace window
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            job.run(&config, 0, stop_rx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Job did not terminate after the stop signal was sent; \
+             process group kill is not working"
         );
     }
 }
