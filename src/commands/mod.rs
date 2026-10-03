@@ -125,7 +125,10 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::DaemonStop) => stop_daemon(),
         Some(Commands::Status) => check_daemon_status(),
         Some(Commands::Info { id }) => info_job(id),
-        Some(Commands::Edit { id, cron_expression }) => edit_job(id, cron_expression),
+        Some(Commands::Edit {
+            id,
+            cron_expression,
+        }) => edit_job(id, cron_expression),
         Some(Commands::DaemonInternal) => run_daemon_internal(),
         Some(Commands::Logs {
             id,
@@ -593,9 +596,8 @@ fn show_logs(
     let mut pos: u64 = 0;
 
     if log_path.exists() {
-        let raw = std::fs::read_to_string(&log_path).map_err(|e| {
-            CronrError::ConfigError(format!("Failed to read log file: {}", e))
-        })?;
+        let raw = std::fs::read_to_string(&log_path)
+            .map_err(|e| CronrError::ConfigError(format!("Failed to read log file: {}", e)))?;
 
         let output = filter_log_lines(&raw, timestamps, lines);
         print!("{}", output);
@@ -611,7 +613,10 @@ fn show_logs(
     // ── Follow / streaming mode ───────────────────────────────────────────────
 
     if follow {
-        println!("--- streaming {} logs for job {} (Ctrl-C to stop) ---", stream_label, id);
+        println!(
+            "--- streaming {} logs for job {} (Ctrl-C to stop) ---",
+            stream_label, id
+        );
         let _ = io::stdout().flush();
 
         loop {
@@ -638,16 +643,13 @@ fn show_logs(
             }
 
             // Read only the new bytes that appeared since the last check
-            let mut file = std::fs::File::open(&log_path).map_err(|e| {
-                CronrError::ConfigError(format!("Failed to open log file: {}", e))
-            })?;
-            file.seek(SeekFrom::Start(pos)).map_err(|e| {
-                CronrError::ConfigError(format!("Failed to seek log file: {}", e))
-            })?;
+            let mut file = std::fs::File::open(&log_path)
+                .map_err(|e| CronrError::ConfigError(format!("Failed to open log file: {}", e)))?;
+            file.seek(SeekFrom::Start(pos))
+                .map_err(|e| CronrError::ConfigError(format!("Failed to seek log file: {}", e)))?;
             let mut buf = Vec::new();
-            file.read_to_end(&mut buf).map_err(|e| {
-                CronrError::ConfigError(format!("Failed to read log file: {}", e))
-            })?;
+            file.read_to_end(&mut buf)
+                .map_err(|e| CronrError::ConfigError(format!("Failed to read log file: {}", e)))?;
 
             pos = new_size;
 
