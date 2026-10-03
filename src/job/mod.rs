@@ -623,8 +623,17 @@ impl JobExecutor {
 
                 // Persist the updated job state (next_run, last_executed) to disk
                 // so the daemon reload cycle and any restarts see accurate info
-                if let Err(e) = config.update_job_state(id, &job) {
-                    log::error!("Failed to persist job {} state: {}", id, e);
+                // A contended cross-process lock must not block the scheduler's async worker.
+                let persistence_config = config.clone();
+                let completed = job.clone();
+                match tokio::task::spawn_blocking(move || {
+                    persistence_config.update_job_state(id, &completed)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => log::error!("Failed to persist job {} state: {}", id, error),
+                    Err(error) => log::error!("Job {} persistence task failed: {}", id, error),
                 }
 
                 // Update the next run time
@@ -890,7 +899,6 @@ mod tests {
         let mut job = Job::new("echo $CRONR_TEST_VAR".to_string(), "0 * * * * *".to_string()).unwrap();
         job.env.insert("CRONR_TEST_VAR".to_string(), "test_value_42".to_string());
 
-        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let result = job.run(&config, 0, stop_rx).await;
         assert!(result.is_ok(), "Expected command to succeed: {:?}", result);
