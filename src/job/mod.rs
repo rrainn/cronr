@@ -21,21 +21,21 @@ use crate::logger::Logger;
 /// 5 fields are present the function prepends `"0 "` so the job fires at second 0
 /// of each matching minute rather than every second.
 fn normalize_cron_expression(expr: &str) -> String {
-	// Count whitespace-delimited tokens; 5 tokens → standard cron, prepend seconds.
-	let field_count = expr.split_whitespace().count();
-	if field_count == 5 {
-		format!("0 {}", expr)
-	} else {
-		expr.to_string()
-	}
+    // Count whitespace-delimited tokens; 5 tokens → standard cron, prepend seconds.
+    let field_count = expr.split_whitespace().count();
+    if field_count == 5 {
+        format!("0 {}", expr)
+    } else {
+        expr.to_string()
+    }
 }
 
 /// Parse a cron expression into a [`Schedule`], accepting both the standard
 /// 5-field format and the 6-field (seconds-prefixed) format used by the `cron` crate.
 fn parse_cron_schedule(expr: &str) -> Result<Schedule> {
-	normalize_cron_expression(expr)
-		.parse::<Schedule>()
-		.map_err(|e| CronrError::InvalidCronExpression(e.to_string()))
+    normalize_cron_expression(expr)
+        .parse::<Schedule>()
+        .map_err(|e| CronrError::InvalidCronExpression(e.to_string()))
 }
 
 /// The outcome of the most recent execution of a job
@@ -302,7 +302,12 @@ impl Job {
     /// process group (shell + every pipeline child such as `docker exec`,
     /// `pg_dumpall`, `pv`, `gzip`, …) is sent SIGTERM followed by SIGKILL so
     /// no orphaned processes are left behind.
-    pub async fn run(&mut self, config: &Config, job_id: usize, mut stop_signal: watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(
+        &mut self,
+        config: &Config,
+        job_id: usize,
+        mut stop_signal: watch::Receiver<bool>,
+    ) -> Result<()> {
         // Advance the schedule immediately to prevent tight retry loops on failure.
         // Even if this execution fails, we should wait for the next scheduled time
         // rather than retrying immediately.
@@ -343,7 +348,12 @@ impl Job {
         // Instead, all required environment (PATH, HOME, DOCKER_HOST, etc.) is
         // passed explicitly via the captured env map, matching what traditional
         // cron daemons (vixie cron, dcron) do.
-        log::debug!("Job {} running via shell: {} -c {:?}", job_id, shell, self.command);
+        log::debug!(
+            "Job {} running via shell: {} -c {:?}",
+            job_id,
+            shell,
+            self.command
+        );
         let mut command = Command::new(shell);
         command
             .args(["-c", &self.command])
@@ -410,7 +420,9 @@ impl Job {
         async fn drain<R: tokio::io::AsyncRead + Unpin>(reader: R) -> Vec<u8> {
             use tokio::io::AsyncReadExt;
             let mut buf = Vec::new();
-            let _ = tokio::io::BufReader::new(reader).read_to_end(&mut buf).await;
+            let _ = tokio::io::BufReader::new(reader)
+                .read_to_end(&mut buf)
+                .await;
             buf
         }
 
@@ -494,11 +506,7 @@ impl Job {
             self.last_run_status = Some(JobRunStatus::Success);
             Ok(())
         } else {
-            log::warn!(
-                "Job {} command exited with status: {}",
-                job_id,
-                exit_info
-            );
+            log::warn!("Job {} command exited with status: {}", job_id, exit_info);
             // Record failed run status before returning the error so that
             // `config.update_job_state` (called by the executor) persists it
             self.last_run_status = Some(JobRunStatus::Failed(exit_info.clone()));
@@ -623,8 +631,17 @@ impl JobExecutor {
 
                 // Persist the updated job state (next_run, last_executed) to disk
                 // so the daemon reload cycle and any restarts see accurate info
-                if let Err(e) = config.update_job_state(id, &job) {
-                    log::error!("Failed to persist job {} state: {}", id, e);
+                // A contended cross-process lock must not block the scheduler's async worker.
+                let persistence_config = config.clone();
+                let completed = job.clone();
+                match tokio::task::spawn_blocking(move || {
+                    persistence_config.update_job_state(id, &completed)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => log::error!("Failed to persist job {} state: {}", id, error),
+                    Err(error) => log::error!("Job {} persistence task failed: {}", id, error),
                 }
 
                 // Update the next run time
@@ -764,7 +781,10 @@ mod tests {
         // Run the job - should fail because the command doesn't exist
         let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let result = job.run(&config, 0, stop_rx).await;
-        assert!(result.is_err(), "Expected job to fail with non-existent command");
+        assert!(
+            result.is_err(),
+            "Expected job to fail with non-existent command"
+        );
 
         // After the fix: next_run should advance to the future to prevent tight retry loops
         let new_next_run = job.next_run().unwrap();
@@ -782,11 +802,19 @@ mod tests {
         let config = Config::with_data_dir(temp_dir.path()).unwrap();
 
         // Use a command that only works when interpreted by a shell (echo is a shell builtin)
-        let mut job = Job::new("echo hello_from_shell".to_string(), "0 * * * * *".to_string()).unwrap();
+        let mut job = Job::new(
+            "echo hello_from_shell".to_string(),
+            "0 * * * * *".to_string(),
+        )
+        .unwrap();
 
         let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let result = job.run(&config, 0, stop_rx).await;
-        assert!(result.is_ok(), "Expected shell command to succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Expected shell command to succeed: {:?}",
+            result
+        );
 
         // Verify stdout was captured to the log file
         let stdout_log = std::fs::read_to_string(config.stdout_log_path(0)).unwrap();
@@ -847,7 +875,10 @@ mod tests {
             Some(JobRunStatus::Failed(info)) => {
                 assert_eq!(info, "1", "Expected exit code '1' in Failed status");
             }
-            other => panic!("Expected last_run_status to be Failed(\"1\"), got {:?}", other),
+            other => panic!(
+                "Expected last_run_status to be Failed(\"1\"), got {:?}",
+                other
+            ),
         }
     }
 
@@ -887,10 +918,14 @@ mod tests {
         let config = Config::with_data_dir(temp_dir.path()).unwrap();
 
         // Create a job that prints a custom env var we'll inject
-        let mut job = Job::new("echo $CRONR_TEST_VAR".to_string(), "0 * * * * *".to_string()).unwrap();
-        job.env.insert("CRONR_TEST_VAR".to_string(), "test_value_42".to_string());
+        let mut job = Job::new(
+            "echo $CRONR_TEST_VAR".to_string(),
+            "0 * * * * *".to_string(),
+        )
+        .unwrap();
+        job.env
+            .insert("CRONR_TEST_VAR".to_string(), "test_value_42".to_string());
 
-        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let result = job.run(&config, 0, stop_rx).await;
         assert!(result.is_ok(), "Expected command to succeed: {:?}", result);
@@ -984,7 +1019,9 @@ mod tests {
         // Inject a canary variable into the current process environment.
         // Because job.run() calls env_clear() it must NOT appear in the child.
         // SAFETY: single-threaded test; no other threads read this variable.
-        unsafe { std::env::set_var("CRONR_DAEMON_CANARY_LEAK", "should_not_appear"); }
+        unsafe {
+            std::env::set_var("CRONR_DAEMON_CANARY_LEAK", "should_not_appear");
+        }
 
         let mut job = Job::new(
             "echo ${CRONR_DAEMON_CANARY_LEAK:-not_set}".to_string(),
@@ -1006,7 +1043,9 @@ mod tests {
             stdout_log
         );
 
-        unsafe { std::env::remove_var("CRONR_DAEMON_CANARY_LEAK"); }
+        unsafe {
+            std::env::remove_var("CRONR_DAEMON_CANARY_LEAK");
+        }
     }
 
     /// Test that DOCKER_HOST is captured in the job env when present, so that
@@ -1015,7 +1054,9 @@ mod tests {
     #[test]
     fn test_job_captures_docker_host() {
         // SAFETY: single-threaded test; no other threads read this variable.
-        unsafe { std::env::set_var("DOCKER_HOST", "unix:///run/user/1000/docker.sock"); }
+        unsafe {
+            std::env::set_var("DOCKER_HOST", "unix:///run/user/1000/docker.sock");
+        }
 
         let job = Job::new("echo test".to_string(), "0 * * * * *".to_string()).unwrap();
         assert_eq!(
@@ -1024,6 +1065,8 @@ mod tests {
             "DOCKER_HOST must be captured so docker exec works in daemon jobs"
         );
 
-        unsafe { std::env::remove_var("DOCKER_HOST"); }
+        unsafe {
+            std::env::remove_var("DOCKER_HOST");
+        }
     }
 }

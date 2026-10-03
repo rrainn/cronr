@@ -65,15 +65,12 @@ impl Daemon {
                     CronrError::DaemonStartFailed(format!("Failed to get executable path: {}", e))
                 })?;
 
-                let status = Command::new(exe)
-                    .arg("daemon-internal")
-                    .status()
-                    .map_err(|e| {
-                        CronrError::DaemonStartFailed(format!(
-                            "Failed to start daemon process: {}",
-                            e
-                        ))
-                    })?;
+                let status = Command::new(exe).arg("daemon-internal").status();
+                // daemonize records this wrapper's PID, so it owns cleanup after its child exits.
+                self.remove_owned_pid();
+                let status = status.map_err(|e| {
+                    CronrError::DaemonStartFailed(format!("Failed to start daemon process: {}", e))
+                })?;
 
                 // This should not be reached in the daemon process
                 if !status.success() {
@@ -92,6 +89,21 @@ impl Daemon {
                     e
                 )));
             }
+        }
+    }
+
+    /// Remove this process's PID marker on success or failure without masking the original error.
+    pub fn remove_owned_pid(&self) {
+        let path = self.pid_file();
+        match fs::read_to_string(&path) {
+            Ok(pid) if pid.trim() == std::process::id().to_string() => {
+                if let Err(error) = fs::remove_file(&path) {
+                    log::warn!("Could not remove PID file {}: {}", path.display(), error);
+                }
+            }
+            Ok(_) => {} // Another process owns this lifecycle marker.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!("Could not read PID file {}: {}", path.display(), error),
         }
     }
 
@@ -235,7 +247,12 @@ impl Daemon {
         #[cfg(target_os = "windows")]
         {
             let output = match Command::new("tasklist")
-                .args(&["/FI", &format!("PID eq {}", pid), "/FI", "IMAGENAME eq cronr.exe"])
+                .args(&[
+                    "/FI",
+                    &format!("PID eq {}", pid),
+                    "/FI",
+                    "IMAGENAME eq cronr.exe",
+                ])
                 .output()
             {
                 Ok(o) => o,
@@ -399,12 +416,20 @@ impl DaemonRunner {
 
     /// Run the daemon, dynamically reloading jobs
     pub async fn run(&mut self) -> Result<()> {
+        let result = self.run_loop().await;
+        // Stop executors even when reload fails, without masking the parse diagnostic.
+        let cleanup = self.stop_all_jobs().await;
+        result.and(cleanup)
+    }
+
+    /// Keep reload failures visible to the caller responsible for lifecycle cleanup.
+    async fn run_loop(&mut self) -> Result<()> {
         // Log startup
         log::info!("Daemon starting up");
 
         loop {
             // Reload job manager from disk to pick up external changes
-            self.job_manager = JobManager::load().await?;
+            self.job_manager = JobManager::with_config(self.job_manager.config().clone()).await?;
             // Get all jobs from the freshly loaded state
             let jobs = self.job_manager.get_all_jobs().await;
             log::info!("Loaded {} jobs", jobs.len());
@@ -478,8 +503,6 @@ impl DaemonRunner {
             }
         }
 
-        // Stop all jobs on shutdown
-        self.stop_all_jobs().await?;
         Ok(())
     }
 
@@ -671,5 +694,51 @@ mod tests {
              stale/reused PIDs must not be treated as a live daemon",
             pid
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_regressions {
+    use super::*;
+
+    /// A reload error must retain its parse diagnostic and stop existing executor tasks.
+    #[tokio::test]
+    async fn reload_error_stops_executors() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::with_data_dir(directory.path()).unwrap();
+        let manager = JobManager::with_config(config.clone()).await.unwrap();
+        let id = manager
+            .add_job("true".into(), "0 0 0 1 1 *".into())
+            .await
+            .unwrap();
+        let job = manager.get_job(id).await.unwrap();
+        let mut runner = DaemonRunner::with_job_manager(manager).await.unwrap();
+        runner.start_job(id, job).await.unwrap();
+        std::fs::write(config.jobs_file(), b"{}1\n}").unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), runner.run())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("trailing characters"));
+        assert!(runner.job_handles.is_empty());
+        assert!(runner.job_stop_signals.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pid_cleanup_regressions {
+    use super::*;
+
+    /// PID cleanup must release the wrapper's marker and leave another daemon's marker alone.
+    #[test]
+    fn cleanup_respects_pid_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(directory.path().to_path_buf());
+        fs::write(daemon.pid_file(), std::process::id().to_string()).unwrap();
+        daemon.remove_owned_pid();
+        assert!(!daemon.pid_file().exists());
+        fs::write(daemon.pid_file(), "0").unwrap();
+        daemon.remove_owned_pid();
+        assert_eq!(fs::read_to_string(daemon.pid_file()).unwrap(), "0");
     }
 }

@@ -22,8 +22,9 @@ daemonize = "0.5"                                  # For creating daemon process
 rolling-file = "0.2"                               # For log rotation
 nix = "0.26"                                       # Unix-specific functionality
 
+tempfile = "3.8"                                   # Exclusive temporary files for atomic persistence
+
 [dev-dependencies]
-tempfile = "3.8"                                   # Temporary file handling for tests
 assert_cmd = "2.0"                                 # Testing command line applications
 predicates = "3.0"                                 # Assertions for command output
 

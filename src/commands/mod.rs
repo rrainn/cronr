@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::process;
 use tokio::runtime::Runtime;
 
 use crate::config::JobManager;
@@ -126,7 +125,10 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::DaemonStop) => stop_daemon(),
         Some(Commands::Status) => check_daemon_status(),
         Some(Commands::Info { id }) => info_job(id),
-        Some(Commands::Edit { id, cron_expression }) => edit_job(id, cron_expression),
+        Some(Commands::Edit {
+            id,
+            cron_expression,
+        }) => edit_job(id, cron_expression),
         Some(Commands::DaemonInternal) => run_daemon_internal(),
         Some(Commands::Logs {
             id,
@@ -159,7 +161,7 @@ fn create_job(command: String, cron_expression: String) -> Result<()> {
     })?;
 
     // Run the async block
-    rt.block_on(async {
+    let data_dir = rt.block_on(async {
         // Create the job manager
         let job_manager = JobManager::new().await?;
 
@@ -172,17 +174,17 @@ fn create_job(command: String, cron_expression: String) -> Result<()> {
         println!("Added job {} with schedule '{}'", id, cron_expression);
         println!("Command: {}", command);
 
-        // Return success and ensure daemon is running to execute jobs
-        let data_dir = job_manager.config().data_dir().to_path_buf();
-        let daemon = Daemon::new(data_dir);
-        // Start daemon if not already running
-        if !daemon.is_running() {
-            daemon.start()?;
-            println!("Started daemon for job execution");
-        }
+        Ok::<_, CronrError>(job_manager.config().data_dir().to_path_buf())
+    })?;
 
-        Ok(())
-    })
+    // Fork only after runtime workers have stopped; inherited Tokio state is unsafe in a daemon.
+    drop(rt);
+    let daemon = Daemon::new(data_dir);
+    if !daemon.is_running() {
+        daemon.start()?;
+        println!("Started daemon for job execution");
+    }
+    Ok(())
 }
 
 /// List all cron jobs
@@ -256,33 +258,22 @@ fn start_daemon() -> Result<()> {
         CronrError::InitializationError(format!("Failed to create async runtime: {}", e))
     })?;
 
-    // Run the async block
-    rt.block_on(async {
-        // Load or initialize the job manager (initialize if data dir missing)
-        let job_manager = match JobManager::load().await {
-            Ok(jm) => jm,
-            Err(CronrError::ConfigError(_)) => JobManager::new().await?,
-            Err(e) => return Err(e),
-        };
+    let data_dir = rt.block_on(async {
+        // Initialize missing storage while preserving any existing parse or I/O error.
+        let job_manager = JobManager::new().await?;
+        Ok::<_, CronrError>(job_manager.config().data_dir().to_path_buf())
+    })?;
 
-        // Create the daemon
-        let daemon = Daemon::new(job_manager.config().data_dir().to_path_buf());
-
-        // Check if the daemon is already running
-        if daemon.is_running() {
-            println!("Daemon is already running.");
-            return Ok(());
-        }
-
-        // Start the daemon
-        daemon.start()?;
-
-        // Print the status
-        println!("Started daemon.");
-
-        // Return success
-        Ok(())
-    })
+    // Daemonization must not inherit active runtime workers or their locks.
+    drop(rt);
+    let daemon = Daemon::new(data_dir);
+    if daemon.is_running() {
+        println!("Daemon is already running.");
+        return Ok(());
+    }
+    daemon.start()?;
+    println!("Started daemon.");
+    Ok(())
 }
 
 /// Stop the daemon
@@ -326,12 +317,8 @@ fn check_daemon_status() -> Result<()> {
 
     // Run the async block
     rt.block_on(async {
-        // Load or initialize the job manager (initialize if data dir missing)
-        let job_manager = match JobManager::load().await {
-            Ok(jm) => jm,
-            Err(CronrError::ConfigError(_)) => JobManager::new().await?,
-            Err(e) => return Err(e),
-        };
+        // Initialize missing storage while preserving any existing parse or I/O error.
+        let job_manager = JobManager::new().await?;
 
         // Get active job count
         let active_count = job_manager.get_all_jobs().await.len();
@@ -460,14 +447,10 @@ fn edit_job(id: usize, cron_expression: String) -> Result<()> {
         // Load the job manager from existing configuration
         let job_manager = JobManager::load().await?;
 
-        // Retrieve the current job by ID
-        let mut job = job_manager.get_job(id).await?;
-
-        // Update the cron schedule (validates the expression and recalculates next_run)
-        job.reschedule(cron_expression.clone())?;
-
-        // Persist the updated job
-        job_manager.update_job(id, job).await?;
+        // Apply the schedule to the latest disk state under the persistence lock.
+        job_manager
+            .reschedule_job(id, cron_expression.clone())
+            .await?;
 
         // Confirm the change to the user
         println!("Updated job {} schedule to '{}'", id, cron_expression);
@@ -495,29 +478,16 @@ fn run_daemon_internal() -> Result<()> {
 
         log::info!("Starting daemon internal process");
 
-        // Create the daemon runner using load() instead of new() to ensure jobs persist across restarts
-        let mut daemon_runner = DaemonRunner::load().await?;
-
-        // Log that we're restoring jobs from previous configuration
-        log::info!("Restoring jobs from existing configuration");
-
-        // Run the daemon
-        daemon_runner.run().await?;
-
-        // Clean up the PID file on graceful shutdown.
-        // Without this, a stale PID file left on disk can cause `is_running()` to return a
-        // false positive if the OS later reuses the dead daemon's PID for another program.
-        if let Ok(data_dir) = crate::config::Config::default_data_dir() {
-            let pid_file = data_dir.join("cronr.pid");
-            if let Err(e) = std::fs::remove_file(&pid_file) {
-                log::warn!("Could not remove PID file on shutdown: {}", e);
-            } else {
-                log::info!("Removed PID file on shutdown");
-            }
+        // Capture startup and runtime failures so PID cleanup runs on every exit path.
+        let result = async {
+            let mut daemon_runner = DaemonRunner::load().await?;
+            daemon_runner.run().await
         }
-
-        // This should never return
-        process::exit(0);
+        .await;
+        if let Ok(data_dir) = crate::config::Config::default_data_dir() {
+            Daemon::new(data_dir).remove_owned_pid();
+        }
+        result
     })
 }
 
@@ -626,9 +596,8 @@ fn show_logs(
     let mut pos: u64 = 0;
 
     if log_path.exists() {
-        let raw = std::fs::read_to_string(&log_path).map_err(|e| {
-            CronrError::ConfigError(format!("Failed to read log file: {}", e))
-        })?;
+        let raw = std::fs::read_to_string(&log_path)
+            .map_err(|e| CronrError::ConfigError(format!("Failed to read log file: {}", e)))?;
 
         let output = filter_log_lines(&raw, timestamps, lines);
         print!("{}", output);
@@ -644,7 +613,10 @@ fn show_logs(
     // ── Follow / streaming mode ───────────────────────────────────────────────
 
     if follow {
-        println!("--- streaming {} logs for job {} (Ctrl-C to stop) ---", stream_label, id);
+        println!(
+            "--- streaming {} logs for job {} (Ctrl-C to stop) ---",
+            stream_label, id
+        );
         let _ = io::stdout().flush();
 
         loop {
@@ -671,16 +643,13 @@ fn show_logs(
             }
 
             // Read only the new bytes that appeared since the last check
-            let mut file = std::fs::File::open(&log_path).map_err(|e| {
-                CronrError::ConfigError(format!("Failed to open log file: {}", e))
-            })?;
-            file.seek(SeekFrom::Start(pos)).map_err(|e| {
-                CronrError::ConfigError(format!("Failed to seek log file: {}", e))
-            })?;
+            let mut file = std::fs::File::open(&log_path)
+                .map_err(|e| CronrError::ConfigError(format!("Failed to open log file: {}", e)))?;
+            file.seek(SeekFrom::Start(pos))
+                .map_err(|e| CronrError::ConfigError(format!("Failed to seek log file: {}", e)))?;
             let mut buf = Vec::new();
-            file.read_to_end(&mut buf).map_err(|e| {
-                CronrError::ConfigError(format!("Failed to read log file: {}", e))
-            })?;
+            file.read_to_end(&mut buf)
+                .map_err(|e| CronrError::ConfigError(format!("Failed to read log file: {}", e)))?;
 
             pos = new_size;
 

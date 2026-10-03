@@ -1,7 +1,8 @@
-use dirs;
+use nix::fcntl::{FlockArg, flock};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -130,51 +131,66 @@ impl Config {
     /// in sync with the in-memory state, so that daemon reload cycles and restarts
     /// see accurate schedule information.
     pub fn update_job_state(&self, job_id: usize, job: &crate::job::Job) -> Result<()> {
+        self.transaction(|jobs, _| {
+            // A completed executor must never resurrect a removed job or undo a CLI edit.
+            if let Some(current) = jobs.get_mut(&job_id) {
+                current.last_executed = job.last_executed;
+                current.last_run_status = job.last_run_status.clone();
+                if current.cron_expression == job.cron_expression {
+                    current.next_run = job.next_run;
+                }
+            }
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// Lock a stable sidecar inode so replacement of jobs.json cannot bypass exclusion.
+    fn transaction<T>(
+        &self,
+        mutation: impl FnOnce(&mut HashMap<usize, Job>, &mut usize) -> Result<T>,
+    ) -> Result<(T, HashMap<usize, Job>)> {
+        let lock_path = self.data_dir.join("jobs.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| path_error_to_config_error(&lock_path, e))?;
+        flock(lock.as_raw_fd(), FlockArg::LockExclusive).map_err(|e| {
+            CronrError::ConfigError(format!("Failed to lock {}: {}", lock_path.display(), e))
+        })?;
+        // Each open owns its lock; closing this file releases it even on early errors.
+        let (mut jobs, mut next_id) = JobManager::load_jobs(self)?;
+        let result = mutation(&mut jobs, &mut next_id)?;
+        self.publish_jobs(&jobs, next_id)?;
+        Ok((result, jobs))
+    }
+
+    /// Publish a fully flushed snapshot using an exclusively created file in the same directory.
+    fn publish_jobs(&self, jobs: &HashMap<usize, Job>, next_id: usize) -> Result<()> {
         let jobs_file = self.jobs_file();
-
-        // Nothing to update if the jobs file doesn't exist yet
-        if !jobs_file.exists() {
-            return Ok(());
-        }
-
-        // Read the current jobs file
-        let file =
-            File::open(&jobs_file).map_err(|e| path_error_to_config_error(&jobs_file, e))?;
-        let reader = BufReader::new(file);
-        let mut value: serde_json::Value = serde_json::from_reader(reader)
-            .map_err(|e| CronrError::ConfigError(format!("Failed to parse jobs file: {}", e)))?;
-
-        // Navigate to the correct job entry (supports both new and legacy format)
-        let id_str = job_id.to_string();
-        let jobs_obj = if let Some(jobs) = value.get_mut("jobs") {
-            jobs
-        } else {
-            &mut value
-        };
-
-        // Serialize the updated job and replace the entry
-        if let Some(job_value) = jobs_obj.get_mut(&id_str) {
-            let job_json = serde_json::to_value(job)
-                .map_err(|e| CronrError::ConfigError(format!("Failed to serialize job: {}", e)))?;
-            *job_value = job_json;
-        }
-
-        // Write back atomically via a temp file + rename
-        let temp_file = jobs_file.with_file_name(format!(
-            "{}.tmp",
-            jobs_file.file_name().unwrap().to_string_lossy()
-        ));
-        let file =
-            File::create(&temp_file).map_err(|e| path_error_to_config_error(&temp_file, e))?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, &value)
-            .map_err(|e| CronrError::ConfigError(format!("Failed to write jobs file: {}", e)))?;
-        writer
-            .flush()
-            .map_err(|e| CronrError::ConfigError(format!("Failed to flush jobs file: {}", e)))?;
-        fs::rename(&temp_file, &jobs_file)
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.data_dir)
             .map_err(|e| path_error_to_config_error(&jobs_file, e))?;
-
+        {
+            let mut writer = BufWriter::new(temporary.as_file_mut());
+            serde_json::to_writer_pretty(
+                &mut writer,
+                &serde_json::json!({"jobs": jobs, "next_id": next_id}),
+            )
+            .map_err(|e| CronrError::ConfigError(format!("Failed to write jobs file: {}", e)))?;
+            writer
+                .flush()
+                .map_err(|e| path_error_to_config_error(&jobs_file, e))?;
+        }
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|e| path_error_to_config_error(&jobs_file, e))?;
+        temporary
+            .persist(&jobs_file)
+            .map_err(|e| path_error_to_config_error(&jobs_file, e.error))?;
         Ok(())
     }
 }
@@ -185,56 +201,30 @@ pub struct JobManager {
     /// The configuration
     config: Config,
 
-    /// The jobs
+    /// A local read snapshot; successful mutations refresh it from the locked disk transaction.
     jobs: Arc<Mutex<HashMap<usize, Job>>>,
-
-    /// The next job ID
-    next_id: Arc<Mutex<usize>>,
 }
 
 impl JobManager {
     /// Create a new job manager with the default configuration
     pub async fn new() -> Result<Self> {
-        // Create the configuration
-        let config = Config::new()?;
-
-        // Load the jobs
-        let (jobs, next_id) = Self::load_jobs(&config).await?;
-
-        Ok(JobManager {
-            config,
-            jobs: Arc::new(Mutex::new(jobs)),
-            next_id: Arc::new(Mutex::new(next_id)),
-        })
+        Self::with_config(Config::new()?).await
     }
 
-    /// Create a new job manager with the given configuration
-    /// This is used only in tests
-    #[cfg(test)]
+    /// Load a snapshot using the caller's configured storage directory.
     pub async fn with_config(config: Config) -> Result<Self> {
         // Load the jobs
-        let (jobs, next_id) = Self::load_jobs(&config).await?;
+        let (jobs, _) = Self::load_jobs(&config)?;
 
         Ok(JobManager {
             config,
             jobs: Arc::new(Mutex::new(jobs)),
-            next_id: Arc::new(Mutex::new(next_id)),
         })
     }
 
     /// Load an existing job manager
     pub async fn load() -> Result<Self> {
-        // Load the configuration
-        let config = Config::load()?;
-
-        // Load the jobs
-        let (jobs, next_id) = Self::load_jobs(&config).await?;
-
-        Ok(JobManager {
-            config,
-            jobs: Arc::new(Mutex::new(jobs)),
-            next_id: Arc::new(Mutex::new(next_id)),
-        })
+        Self::with_config(Config::load()?).await
     }
 
     /// Get the configuration
@@ -244,27 +234,32 @@ impl JobManager {
 
     /// Add a new job
     pub async fn add_job(&self, command: String, cron_expression: String) -> Result<usize> {
-        // Create the job
         let job = Job::new(command, cron_expression)?;
-
-        // Get the next ID
-        let id = {
-            let mut next_id = self.next_id.lock().await;
+        self.mutate(move |jobs, next_id| {
             let id = *next_id;
-            *next_id += 1;
-            id
-        };
-
-        // Add the job
-        {
-            let mut jobs = self.jobs.lock().await;
+            *next_id = next_id
+                .checked_add(1)
+                .ok_or_else(|| CronrError::ConfigError("Job IDs exhausted".into()))?;
             jobs.insert(id, job);
-        }
+            Ok(id)
+        })
+        .await
+    }
 
-        // Save the jobs
-        self.save_jobs().await?;
-
-        Ok(id)
+    /// Keep cache updates ordered while blocking file locks and disk I/O run off the async worker.
+    async fn mutate<T: Send + 'static>(
+        &self,
+        mutation: impl FnOnce(&mut HashMap<usize, Job>, &mut usize) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let mut cache = self.jobs.clone().lock_owned().await;
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || {
+            let (result, jobs) = config.transaction(mutation)?;
+            *cache = jobs;
+            Ok(result)
+        })
+        .await
+        .map_err(|e| CronrError::ConfigError(format!("Job persistence task failed: {}", e)))?
     }
 
     /// Get a job
@@ -273,9 +268,7 @@ impl JobManager {
         let jobs = self.jobs.lock().await;
 
         // Get the job
-        jobs.get(&id)
-            .cloned()
-            .ok_or_else(|| CronrError::InvalidJobId(id))
+        jobs.get(&id).cloned().ok_or(CronrError::InvalidJobId(id))
     }
 
     /// Get all jobs
@@ -287,58 +280,38 @@ impl JobManager {
         jobs.clone()
     }
 
-    /// Update a job in-place and persist the change to disk
-    pub async fn update_job(&self, id: usize, job: Job) -> Result<()> {
-        // Lock the jobs map
-        let mut jobs = self.jobs.lock().await;
-
-        // Check if the job exists
-        if !jobs.contains_key(&id) {
-            return Err(CronrError::InvalidJobId(id));
-        }
-
-        // Replace the existing job entry
-        jobs.insert(id, job);
-
-        // Persist to disk (drop the lock first to avoid holding it across I/O)
-        drop(jobs);
-        self.save_jobs().await?;
-
-        Ok(())
+    /// Reschedule the latest persisted job, preserving concurrent completion metadata.
+    pub async fn reschedule_job(&self, id: usize, cron_expression: String) -> Result<()> {
+        self.mutate(move |jobs, _| {
+            jobs.get_mut(&id)
+                .ok_or(CronrError::InvalidJobId(id))?
+                .reschedule(cron_expression)
+        })
+        .await
     }
 
-    /// Remove a job
+    /// Remove only the requested job from the latest snapshot.
     pub async fn remove_job(&self, id: usize) -> Result<()> {
-        // Get the jobs
-        let mut jobs = self.jobs.lock().await;
-
-        // Check if the job exists
-        if !jobs.contains_key(&id) {
-            return Err(CronrError::InvalidJobId(id));
-        }
-
-        // Remove the job
-        jobs.remove(&id);
-
-        // Save the jobs
-        drop(jobs);
-        self.save_jobs().await?;
-
-        Ok(())
+        self.mutate(move |jobs, _| {
+            jobs.remove(&id).ok_or(CronrError::InvalidJobId(id))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Load jobs from the jobs file
-    async fn load_jobs(config: &Config) -> Result<(HashMap<usize, Job>, usize)> {
+    fn load_jobs(config: &Config) -> Result<(HashMap<usize, Job>, usize)> {
         // Get the jobs file path
         let jobs_file = config.jobs_file();
 
-        // If file doesn't exist, start fresh with no jobs and next ID 0
-        if !jobs_file.exists() {
-            return Ok((HashMap::new(), 0));
-        }
-
-        // Open and read the file
-        let file = File::open(&jobs_file).map_err(|e| path_error_to_config_error(&jobs_file, e))?;
+        // Only a missing file means fresh state; permission and other I/O failures remain errors.
+        let file = match File::open(&jobs_file) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((HashMap::new(), 0));
+            }
+            Err(error) => return Err(path_error_to_config_error(&jobs_file, error)),
+        };
         let reader = BufReader::new(file);
 
         // Parse JSON into a value
@@ -350,8 +323,8 @@ impl JobManager {
             // New format with next_id and jobs
             let id = meta
                 .as_u64()
-                .ok_or_else(|| CronrError::ConfigError("Invalid next_id in jobs file".into()))?
-                as usize;
+                .and_then(|id| usize::try_from(id).ok())
+                .ok_or_else(|| CronrError::ConfigError("Invalid next_id in jobs file".into()))?;
             let jobs_val = value
                 .get("jobs")
                 .ok_or_else(|| CronrError::ConfigError("Missing jobs in jobs file".into()))?;
@@ -376,58 +349,13 @@ impl JobManager {
                 .map_err(|_| CronrError::ConfigError(format!("Invalid job ID: {}", id_str)))?;
             jobs.insert(id, job);
             // Calculate the next ID as max(existing+1, metadata)
-            if id + 1 > next_id {
-                next_id = id + 1;
-            }
+            let following = id
+                .checked_add(1)
+                .ok_or_else(|| CronrError::ConfigError("Job IDs exhausted".into()))?;
+            next_id = next_id.max(following);
         }
 
         Ok((jobs, next_id))
-    }
-
-    /// Save jobs to the jobs file
-    async fn save_jobs(&self) -> Result<()> {
-        // Get the jobs file path
-        let jobs_file = self.config.jobs_file();
-
-        // Create a temporary file
-        let temp_file = jobs_file.with_file_name(format!(
-            "{}.tmp",
-            jobs_file.file_name().unwrap().to_string_lossy()
-        ));
-
-        // Create the writer
-        let file =
-            File::create(&temp_file).map_err(|e| path_error_to_config_error(&temp_file, e))?;
-        let mut writer = BufWriter::new(file);
-
-        // Clone jobs into a local owned map and get next_id
-        let jobs_map: HashMap<String, Job> = {
-            let jobs_guard = self.jobs.lock().await;
-            jobs_guard
-                .iter()
-                .map(|(id, job)| (id.to_string(), job.clone()))
-                .collect()
-        };
-        let next_id = { *self.next_id.lock().await };
-
-        // Build wrapper with metadata and jobs
-        let wrapper = serde_json::json!({
-            "next_id": next_id,
-            "jobs": jobs_map
-        });
-
-        // Write the JSON
-        serde_json::to_writer_pretty(&mut writer, &wrapper)
-            .map_err(|e| CronrError::ConfigError(format!("Failed to write jobs file: {}", e)))?;
-        writer
-            .flush()
-            .map_err(|e| CronrError::ConfigError(format!("Failed to flush jobs file: {}", e)))?;
-
-        // Rename the temporary file to the jobs file
-        fs::rename(&temp_file, &jobs_file)
-            .map_err(|e| path_error_to_config_error(&jobs_file, e))?;
-
-        Ok(())
     }
 }
 
@@ -551,13 +479,19 @@ mod tests {
 
         // Get the job and verify initial state
         let mut job = job_manager.get_job(id).await.unwrap();
-        assert!(job.last_executed.is_none(), "last_executed should be None initially");
+        assert!(
+            job.last_executed.is_none(),
+            "last_executed should be None initially"
+        );
 
         // Simulate execution by calling set_as_run
         job.set_as_run();
         let updated_next_run = job.next_run();
         let updated_last_executed = job.last_executed;
-        assert!(updated_last_executed.is_some(), "last_executed should be set after run");
+        assert!(
+            updated_last_executed.is_some(),
+            "last_executed should be set after run"
+        );
 
         // Persist the updated state to disk
         config.update_job_state(id, &job).unwrap();
@@ -570,8 +504,277 @@ mod tests {
             "Reloaded last_executed should match the persisted value"
         );
         assert_eq!(
-            reloaded_job.next_run(), updated_next_run,
+            reloaded_job.next_run(),
+            updated_next_run,
             "Reloaded next_run should match the persisted value"
         );
+    }
+}
+
+#[cfg(test)]
+mod persistence_regressions {
+    use super::*;
+    use crate::job::JobRunStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    /// A CLI manager loaded before completion must not overwrite the completed job.
+    #[tokio::test]
+    async fn stale_cli_mutation_preserves_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(directory.path()).unwrap();
+        let manager = JobManager::with_config(config.clone()).await.unwrap();
+        let id = manager
+            .add_job("true".into(), "0 * * * * *".into())
+            .await
+            .unwrap();
+        let mut completed = manager.get_job(id).await.unwrap();
+        completed.set_as_run();
+        completed.last_run_status = Some(JobRunStatus::Success);
+        config.update_job_state(id, &completed).unwrap();
+        manager
+            .add_job("true".into(), "0 * * * * *".into())
+            .await
+            .unwrap();
+        let reloaded = JobManager::with_config(config).await.unwrap();
+        assert_eq!(
+            reloaded.get_job(id).await.unwrap().last_executed,
+            completed.last_executed
+        );
+    }
+
+    /// Different timestamp lengths expose both shared-inode corruption and lost updates.
+    #[tokio::test]
+    async fn simultaneous_completions_survive_reload() {
+        for _ in 0..50 {
+            let directory = tempfile::tempdir().unwrap();
+            let config = Config::with_data_dir(directory.path()).unwrap();
+            let manager = JobManager::with_config(config.clone()).await.unwrap();
+            for _ in 0..2 {
+                manager
+                    .add_job("true".into(), "0 * * * * *".into())
+                    .await
+                    .unwrap();
+            }
+            let stop_reader = Arc::new(AtomicBool::new(false));
+            let reader_stop = stop_reader.clone();
+            let reader_config = config.clone();
+            // Readers need no lock because publication replaces a complete, closed snapshot.
+            let reader = std::thread::spawn(move || {
+                while !reader_stop.load(Ordering::Acquire) {
+                    let bytes = fs::read(reader_config.jobs_file()).unwrap();
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+                }
+            });
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            let mut expected_timestamps = Vec::new();
+            for id in 0..2 {
+                let mut job = manager.get_job(id).await.unwrap();
+                job.last_executed = Some(
+                    chrono::DateTime::parse_from_rfc3339(if id == 0 {
+                        "2025-01-01T00:00:00.123456789Z"
+                    } else {
+                        "2025-01-01T00:00:00.123456Z"
+                    })
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                );
+                job.last_run_status = Some(JobRunStatus::Success);
+                expected_timestamps.push(job.last_executed);
+                let config = config.clone();
+                let barrier = barrier.clone();
+                threads.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    config.update_job_state(id, &job)
+                }));
+            }
+            let outcomes: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            stop_reader.store(true, Ordering::Release);
+            reader.join().unwrap();
+            for outcome in outcomes {
+                outcome.unwrap();
+            }
+            let reloaded = JobManager::with_config(config).await.unwrap();
+            for (id, expected_timestamp) in expected_timestamps.iter().enumerate() {
+                let job = reloaded.get_job(id).await.unwrap();
+                assert_eq!(job.last_run_status, Some(JobRunStatus::Success));
+                assert_eq!(job.last_executed, *expected_timestamp);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod transaction_regressions {
+    use super::*;
+    use crate::job::JobRunStatus;
+
+    /// Both transaction orders must retain an edited schedule and execution results.
+    #[tokio::test]
+    async fn completion_and_edit_merge_in_both_orders() {
+        for completion_first in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = Config::with_data_dir(directory.path()).unwrap();
+            let manager = JobManager::with_config(config.clone()).await.unwrap();
+            let id = manager
+                .add_job("true".into(), "0 * * * * *".into())
+                .await
+                .unwrap();
+            let mut completed = manager.get_job(id).await.unwrap();
+            completed.set_as_run();
+            completed.last_run_status = Some(JobRunStatus::Success);
+            if completion_first {
+                config.update_job_state(id, &completed).unwrap();
+            }
+            manager
+                .reschedule_job(id, "0 0 * * * *".into())
+                .await
+                .unwrap();
+            let edited_next_run = manager.get_job(id).await.unwrap().next_run;
+            if !completion_first {
+                config.update_job_state(id, &completed).unwrap();
+            }
+            let reloaded = JobManager::with_config(config.clone()).await.unwrap();
+            let job = reloaded.get_job(id).await.unwrap();
+            assert_eq!(job.cron_expression, "0 0 * * * *");
+            assert_eq!(job.next_run, edited_next_run);
+            assert_eq!(job.last_executed, completed.last_executed);
+            assert_eq!(job.last_run_status, completed.last_run_status);
+            manager.remove_job(id).await.unwrap();
+            config.update_job_state(id, &completed).unwrap();
+            assert!(
+                JobManager::with_config(config)
+                    .await
+                    .unwrap()
+                    .get_all_jobs()
+                    .await
+                    .is_empty()
+            );
+        }
+    }
+
+    /// A failed mutation leaves both the persisted snapshot and manager cache intact.
+    #[tokio::test]
+    async fn corrupt_state_is_not_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(directory.path()).unwrap();
+        let manager = JobManager::with_config(config.clone()).await.unwrap();
+        let id = manager
+            .add_job("true".into(), "0 * * * * *".into())
+            .await
+            .unwrap();
+        let original = manager.get_job(id).await.unwrap();
+        let corrupt = b"{}1\n}";
+        fs::write(config.jobs_file(), corrupt).unwrap();
+        let error = manager.remove_job(id).await.unwrap_err();
+        assert!(error.to_string().contains("trailing characters"));
+        assert!(
+            config
+                .update_job_state(id, &original)
+                .unwrap_err()
+                .to_string()
+                .contains("trailing characters")
+        );
+        assert_eq!(fs::read(config.jobs_file()).unwrap(), corrupt);
+        assert!(manager.get_job(id).await.is_ok());
+    }
+
+    /// Legacy maps retain their execution state and allocate IDs above all existing jobs.
+    #[tokio::test]
+    async fn legacy_map_migrates_without_losing_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(directory.path()).unwrap();
+        let mut job = Job::new("true".into(), "0 * * * * *".into()).unwrap();
+        job.set_as_run();
+        job.last_run_status = Some(JobRunStatus::Success);
+        fs::write(
+            config.jobs_file(),
+            serde_json::to_vec(&serde_json::json!({"7": job})).unwrap(),
+        )
+        .unwrap();
+        let manager = JobManager::with_config(config.clone()).await.unwrap();
+        let id = manager
+            .add_job("true".into(), "0 * * * * *".into())
+            .await
+            .unwrap();
+        assert_eq!(id, 8);
+        let reloaded = JobManager::with_config(config).await.unwrap();
+        assert_eq!(
+            reloaded.get_job(7).await.unwrap().last_executed,
+            job.last_executed
+        );
+        assert_eq!(
+            reloaded.get_job(7).await.unwrap().last_run_status,
+            job.last_run_status
+        );
+    }
+
+    /// Child processes use the real persistence boundary and an isolated directory.
+    #[test]
+    fn persistence_child() {
+        let Ok(directory) = std::env::var("CRONR_PERSISTENCE_TEST_DIR") else {
+            return;
+        };
+        let config = Config::with_data_dir(directory).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let manager = JobManager::with_config(config.clone()).await.unwrap();
+            let id: usize = std::env::var("CRONR_PERSISTENCE_TEST_ID")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut job = manager.get_job(id).await.unwrap();
+            job.set_as_run();
+            job.last_run_status = Some(JobRunStatus::Success);
+            config.update_job_state(id, &job).unwrap();
+            manager
+                .add_job(format!("echo child {id}"), "0 * * * * *".into())
+                .await
+                .unwrap();
+        });
+    }
+
+    /// Independent processes must coordinate on the same sidecar, including ID allocation.
+    #[tokio::test]
+    async fn separate_processes_preserve_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::with_data_dir(directory.path()).unwrap();
+        let manager = JobManager::with_config(config.clone()).await.unwrap();
+        for _ in 0..8 {
+            manager
+                .add_job("true".into(), "0 * * * * *".into())
+                .await
+                .unwrap();
+        }
+        let mut children = Vec::new();
+        for id in 0..8 {
+            children.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "config::transaction_regressions::persistence_child",
+                    ])
+                    .env("CRONR_PERSISTENCE_TEST_DIR", directory.path())
+                    .env("CRONR_PERSISTENCE_TEST_ID", id.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let reloaded = JobManager::with_config(config).await.unwrap();
+        assert_eq!(reloaded.get_all_jobs().await.len(), 16);
+        for id in 0..8 {
+            assert_eq!(
+                reloaded.get_job(id).await.unwrap().last_run_status,
+                Some(JobRunStatus::Success)
+            );
+        }
     }
 }

@@ -228,9 +228,12 @@ fn test_run_job_test() {
     }
 
     // Create a job that echoes a known string
-    run_cronr_with_home(&["create", "echo hello_cronr_test", "0 * * * * *"], &home_dir)
-        .success()
-        .stdout(predicates::str::contains("Added job 0"));
+    run_cronr_with_home(
+        &["create", "echo hello_cronr_test", "0 * * * * *"],
+        &home_dir,
+    )
+    .success()
+    .stdout(predicates::str::contains("Added job 0"));
 
     // Run the job once as a test — should succeed and show the separator lines
     run_cronr_with_home(&["run", "0"], &home_dir)
@@ -396,4 +399,118 @@ fn test_info_shows_success_status_after_run() {
         .stdout(predicates::str::contains("N/A"));
 
     temp_dir.close().unwrap();
+}
+
+/// Exercise real CLI writers while the daemon persists two scheduled completions.
+#[test]
+fn concurrent_cli_and_scheduler_preserve_all_jobs() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().to_path_buf();
+    // Seed a disposable production-format fixture without invoking automatic daemon startup.
+    let data = home.join(".cronr");
+    fs::create_dir_all(data.join("logs")).unwrap();
+    let job = serde_json::json!({
+        "command": "true", "cron_expression": "* * * * * *", "enabled": true,
+        "last_executed": null, "next_run": chrono::Utc::now(),
+        "last_run_status": null, "env": {}
+    });
+    fs::write(
+        data.join("jobs.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "jobs": {"0": job, "1": job}, "next_id": 2
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let daemon_log = data.join("test-daemon.log");
+    let daemon = std::process::Command::new(env!("CARGO_BIN_EXE_cronr"))
+        .env("HOME", &home)
+        .arg("daemon-internal")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&daemon_log).unwrap())
+        .spawn()
+        .unwrap();
+    // RAII ensures test failures cannot leave a scheduler running against a deleted fixture.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let pid = daemon.id();
+    let mut daemon = ChildGuard(daemon);
+    // CLI create must see this scheduler's PID, avoiding duplicate auto-start wrappers.
+    let pid_file = data.join("cronr.pid");
+    fs::write(&pid_file, pid.to_string()).unwrap();
+    let mut writers = Vec::new();
+    for index in 0..12 {
+        writers.push(
+            std::process::Command::new(env!("CARGO_BIN_EXE_cronr"))
+                .env("HOME", &home)
+                .args(["create", &format!("echo cli {index}"), "0 0 0 1 1 *"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for mut writer in writers {
+        assert!(writer.wait().unwrap().success());
+    }
+    let jobs_file = home.join(".cronr/jobs.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&jobs_file).unwrap()).unwrap();
+        assert_eq!(value["jobs"].as_object().unwrap().len(), 14);
+        if (0..2).all(|id| value["jobs"][id.to_string()]["last_run_status"] == "success") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Both scheduled completions must persist"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Graceful shutdown exercises the production lifecycle path without waiting for a reload.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = daemon.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Daemon must stop promptly: {}",
+            fs::read_to_string(&daemon_log).unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!pid_file.exists());
+}
+
+/// Corrupt input remains untouched and the CLI preserves its original parse diagnostic.
+#[test]
+fn corrupt_jobs_fail_without_reinitializing() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().to_path_buf();
+    let data = home.join(".cronr");
+    fs::create_dir_all(&data).unwrap();
+    let corrupt = b"{}1\n}";
+    fs::write(data.join("jobs.json"), corrupt).unwrap();
+    for args in [
+        &["status"][..],
+        &["create", "true", "0 * * * * *"],
+        &["daemon-internal"],
+    ] {
+        run_cronr_with_home(args, &home)
+            .failure()
+            .stderr(predicates::str::contains("trailing characters"));
+        assert_eq!(fs::read(data.join("jobs.json")).unwrap(), corrupt);
+    }
 }

@@ -150,13 +150,19 @@ impl Logger {
     /// when the preceding output does not end with a newline.  A trailing blank
     /// line visually separates successive runs.
     pub fn write_stdout_run_footer(&self, timestamp: &str, exit_info: &str) -> Result<()> {
-        let footer = format!("\n=== Run ended at {} (exit: {}) ===\n\n", timestamp, exit_info);
+        let footer = format!(
+            "\n=== Run ended at {} (exit: {}) ===\n\n",
+            timestamp, exit_info
+        );
         self.write_log(&self.stdout_path, footer.as_bytes())
     }
 
     /// Write a run-end footer line to the stderr log.
     pub fn write_stderr_run_footer(&self, timestamp: &str, exit_info: &str) -> Result<()> {
-        let footer = format!("\n=== Run ended at {} (exit: {}) ===\n\n", timestamp, exit_info);
+        let footer = format!(
+            "\n=== Run ended at {} (exit: {}) ===\n\n",
+            timestamp, exit_info
+        );
         self.write_log(&self.stderr_path, footer.as_bytes())
     }
 

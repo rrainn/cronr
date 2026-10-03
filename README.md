@@ -106,11 +106,16 @@ This shows:
 
 Cronr stores all its data in the `~/.cronr` directory:
 
-- `jobs.json`: Contains all job configurations
+- `jobs.json`: Contains all job configurations. Mutations reload the latest state under a cross-process lock and publish through exclusively created temporary files, preserving concurrent job completions and CLI changes.
+- `jobs.lock`: Stable persistence lock file; keep it in place while cronr is running.
 - `logs/`: Directory containing all job output logs
   - `{job_id}.out.log`: Standard output from the job
   - `{job_id}.err.log`: Standard error from the job
   - Log files rotate when they reach 5MB in size
+
+Existing legacy job maps remain readable and are migrated to the metadata format on the next successful mutation. Invalid JSON is reported with its original parse diagnostic and is never replaced with an empty configuration. The scheduler's graceful shutdown and reload-failure paths stop executors. The owning process cleans up its PID marker after the internal scheduler exits.
+
+When upgrading, stop the old daemon before installing and restarting the new binary: older versions do not participate in the persistence lock. To roll back, stop cronr and reinstall the previous binary; the JSON schema is unchanged. Back up `jobs.json` before manually repairing a corrupt file.
 
 ## Development
 
